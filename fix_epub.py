@@ -134,6 +134,23 @@ def fix_malformed_xml(content):
     # Fix meta tags with malformed syntax like: <meta ... / />
     content = re.sub(r'<meta([^>]*?)\s+/\s+/>', r'<meta\1 />', content)
     
+    # Fix specific malformed meta pattern: name="..."     / />
+    content = re.sub(r'(<meta[^>]*?)\s+/\s*/>', r'\1 />', content)
+    
+    # Fix the specific pattern: many spaces followed by / />
+    content = re.sub(r'<meta([^>]*?)\s{4,}/\s*/>', r'<meta\1 />', content)
+    
+    # Fix malformed meta tags with extra spaces and slashes
+    content = re.sub(r'<meta([^>]*?)\s+/\s*/>', r'<meta\1 />', content)
+    content = re.sub(r'<meta([^>]*?)\s+/\s+/>', r'<meta\1 />', content)
+    content = re.sub(r'<meta([^>]*?)\s*/\s*/>', r'<meta\1 />', content)
+    
+    # Fix other malformed tags
+    content = re.sub(r'<([^>]+)\s+/\s*/>', r'<\1 />', content)
+    
+    # Fix charset with extra quotes and malformed ending
+    content = re.sub(r'charset="([^"]+)"\s+/\s*/>', r'charset="\1" />', content)
+    
     # Fix malformed div tags missing closing bracket
     content = re.sub(r'<div([^>]*[^>])(<p>)', r'<div\1>\n\2', content)
     
@@ -155,6 +172,68 @@ def fix_malformed_xml(content):
     content = fix_malformed_brackets(content)
     content = fix_meta_spacing_issues(content)
     content = fix_div_and_paragraph_elements(content)
+    
+    return content
+
+def fix_malformed_img_tags(content):
+    """Fix malformed <img> tags that are missing proper closing"""
+    original_content = content
+    
+    # Enhanced img tag pattern from comprehensive_epub_fix.py
+    # Look for <img followed by attributes but not properly closed
+    img_pattern = r'<img([^>]*?)(?<!/)>(?!\s*</img>)'
+    
+    def fix_img_tag(match):
+        attributes = match.group(1)
+        # If attributes don't end with /, add it
+        if not attributes.strip().endswith('/'):
+            return f'<img{attributes} />'
+        else:
+            return f'<img{attributes}>'
+    
+    content = re.sub(img_pattern, fix_img_tag, content)
+    
+    # Also fix any img tags that might be missing the space before />
+    content = re.sub(r'<img([^>]*?)(?<!\s)(/?)>', r'<img\1 />', content)
+    
+    # Additional comprehensive fixes for img tags
+    content = re.sub(r'<img([^>]*?)(?<!/)>(?!\s*</img>)', r'<img\1 />', content)
+    
+    return content
+
+def fix_ncx_file_content(content):
+    """Fix NCX parsing errors - enhanced from comprehensive_epub_fix.py"""
+    original_content = content
+    
+    # Fix common NCX issues
+    # Remove any text content that shouldn't be there
+    # Fix malformed meta tags
+    content = re.sub(r'<meta([^>]*?)(?<!/)>(?!\s*</meta>)', r'<meta\1 />', content)
+    
+    # Ensure proper XML declaration
+    if not content.strip().startswith('<?xml'):
+        content = '<?xml version="1.0" encoding="UTF-8"?>\n' + content
+    
+    # Fix any text nodes that shouldn't be there in the root
+    lines = content.split('\n')
+    fixed_lines = []
+    in_ncx = False
+    
+    for line in lines:
+        if '<ncx' in line:
+            in_ncx = True
+        elif '</ncx>' in line:
+            in_ncx = False
+            fixed_lines.append(line)
+            continue
+        
+        if in_ncx and line.strip() and not line.strip().startswith('<') and not line.strip().startswith('<?'):
+            # Skip text content that shouldn't be there
+            continue
+        
+        fixed_lines.append(line)
+    
+    content = '\n'.join(fixed_lines)
     
     return content
 
@@ -345,6 +424,102 @@ def fix_fragment_identifiers(content, file_path):
     
     return content
 
+def extract_missing_fragments(directory):
+    """Extract all fragment identifiers and map them to their target files - from comprehensive_fragment_fix.py"""
+    fragment_map = {}
+    
+    for root, dirs, files in os.walk(directory):
+        for file in files:
+            if file.endswith('.xhtml'):
+                file_path = os.path.join(root, file)
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                    
+                    # Find all href attributes that contain fragment identifiers
+                    href_pattern = re.compile(r'href="([^"]+\.xhtml)#([^"]+)"')
+                    matches = href_pattern.findall(content)
+                    
+                    for target_file, fragment_id in matches:
+                        target_file = os.path.basename(target_file)
+                        if target_file not in fragment_map:
+                            fragment_map[target_file] = set()
+                        fragment_map[target_file].add(fragment_id)
+                        
+                except Exception as e:
+                    print(f"Error reading {file_path}: {e}")
+    
+    return fragment_map
+
+def add_missing_fragment_ids(directory, missing_fragments):
+    """Systematically add missing fragment IDs to files - enhanced from comprehensive_fragment_fix.py"""
+    files_modified = 0
+    
+    for target_file, missing_ids in missing_fragments.items():
+        if not target_file.startswith('Notes_split'):
+            continue
+            
+        file_path = os.path.join(directory, target_file)
+        if not os.path.exists(file_path):
+            continue
+            
+        print(f"Processing {target_file} with {len(missing_ids)} missing IDs...")
+        
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            # Group missing IDs by chapter prefix
+            chapter_groups = {}
+            for fragment_id in missing_ids:
+                # Extract chapter prefix (e.g., 'pre1', 'ch1', 'ch8', etc.)
+                match = re.match(r'([a-z]+\d*)fn\d+', fragment_id)
+                if match:
+                    chapter_prefix = match.group(1)
+                    if chapter_prefix not in chapter_groups:
+                        chapter_groups[chapter_prefix] = []
+                    chapter_groups[chapter_prefix].append(fragment_id)
+            
+            modified = False
+            
+            # Process each chapter group
+            for chapter_prefix, chapter_ids in chapter_groups.items():
+                # Sort IDs by footnote number
+                chapter_ids.sort(key=lambda x: int(re.search(r'fn(\d+)', x).group(1)))
+                print(f"  Adding {len(chapter_ids)} IDs for {chapter_prefix}: {chapter_ids}")
+                
+                # Try to match paragraphs to missing IDs based on numbering
+                for fragment_id in chapter_ids:
+                    # Extract footnote number from fragment ID
+                    fn_match = re.search(r'fn(\d+)', fragment_id)
+                    if fn_match:
+                        fn_number = fn_match.group(1)
+                        
+                        # Look for a paragraph that starts with this number
+                        pattern = f'<p class="bn"([^>]*?)dir="ltr" lang="zh">([^<]*?){fn_number}\.'
+                        match = re.search(pattern, content)
+                        
+                        if match and 'id=' not in match.group(1):
+                            # Add the ID to this paragraph
+                            old_tag = match.group(0)
+                            new_tag = old_tag.replace('<p class="bn"', f'<p class="bn" id="{fragment_id}"')
+                            content = content.replace(old_tag, new_tag)
+                            modified = True
+                            print(f"    Added ID '{fragment_id}' to paragraph {fn_number}")
+            
+            if modified:
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(content)
+                files_modified += 1
+                print(f"  Modified {target_file}")
+            else:
+                print(f"  No changes made to {target_file}")
+                
+        except Exception as e:
+            print(f"Error processing {file_path}: {e}")
+    
+    return files_modified
+
 
 
 def fix_epub2_compatibility(content):
@@ -396,6 +571,12 @@ def fix_epub2_compatibility(content):
     # Fix incomplete body elements by ensuring they have block-level content
     content = fix_incomplete_body_elements(content)
     
+    return content
+
+def fix_metadata_tag(content):
+    """Fix self-closing metadata tag that has content"""
+    # Fix self-closing metadata tag that should be opening tag
+    content = re.sub(r'<metadata([^>]*)/>', r'<metadata\1>', content)
     return content
 
 def fix_ncx_identifier_mismatch(ncx_path, opf_path):
@@ -591,6 +772,24 @@ def fix_incomplete_body_elements(content):
     
     return content
 
+def fix_dir_attributes(content):
+    """Fix invalid dir attribute values - must be 'ltr' or 'rtl'"""
+    print("Fixing invalid dir attributes...")
+    
+    # Find all dir attributes with invalid values and replace with 'ltr'
+    # The pattern matches dir="anything_that_is_not_ltr_or_rtl"
+    content = re.sub(
+        r'dir="(?!ltr|rtl)[^"]*"',
+        'dir="ltr"',
+        content
+    )
+    
+    # Also handle cases where dir attribute might have no value or empty value
+    content = re.sub(r'dir=""', 'dir="ltr"', content)
+    content = re.sub(r'dir=\s*(?=[^"\w])', 'dir="ltr"', content)
+    
+    return content
+
 def fix_xhtml_file(file_path, content, epub_version='epub3'):
     """Apply all XHTML fixes to a file based on EPUB version"""
     print(f"Fixing XHTML file: {file_path} (target: {epub_version})")
@@ -607,6 +806,7 @@ def fix_xhtml_file(file_path, content, epub_version='epub3'):
     # Apply common fixes for both EPUB 2 and 3
     content = fix_section_elements(content)
     content = fix_incomplete_body_elements(content)
+    content = fix_dir_attributes(content)  # Fix invalid dir attributes
     
     # Fix malformed HTML tags
     content = fix_malformed_tags(content)
@@ -875,6 +1075,7 @@ def fix_opf_file(file_path, content, epub_version='epub3'):
     
     # Apply general fixes
     content = fix_malformed_xml(content)
+    content = fix_metadata_tag(content)
     
     # Fix malformed meta tags with property attribute that should be name/content
     # Convert <meta property="dcterms:modified">value</meta> to proper format
@@ -948,6 +1149,7 @@ def fix_epub_files(extract_dir, epub_version='epub3'):
                     content = fix_xhtml_file(file_path, content, epub_version)
                     content = fix_empty_titles(content)
                     content = fix_invalid_width_attributes(content)
+                    content = fix_malformed_img_tags(content)
                     content = fix_fragment_identifiers(content, file_path)
                     
                     # Write back if changed
@@ -989,6 +1191,21 @@ def fix_epub_files(extract_dir, epub_version='epub3'):
         for file in files:
             if file.endswith('.ncx'):
                 ncx_files.append(os.path.join(root, file))
+                # Apply NCX content fixes
+                try:
+                    with open(os.path.join(root, file), 'r', encoding='utf-8') as f:
+                        ncx_content = f.read()
+                    
+                    fixed_ncx_content = fix_ncx_file_content(ncx_content)
+                    
+                    if fixed_ncx_content != ncx_content:
+                        with open(os.path.join(root, file), 'w', encoding='utf-8') as f:
+                            f.write(fixed_ncx_content)
+                        fixed_files.append(os.path.join(root, file))
+                        print(f"Fixed NCX content: {os.path.join(root, file)}")
+                        
+                except Exception as e:
+                    print(f"Error fixing NCX content {os.path.join(root, file)}: {e}")
             elif file.endswith('.opf'):
                 opf_files.append(os.path.join(root, file))
     
@@ -1007,6 +1224,44 @@ def fix_epub_files(extract_dir, epub_version='epub3'):
         
         except Exception as e:
             print(f"Error fixing NCX {ncx_path}: {str(e)}")
+    
+    # Apply comprehensive fragment fixing for OEBPS directory
+    oebps_dir = None
+    for root, dirs, files in os.walk(extract_dir):
+        if 'OEBPS' in dirs:
+            oebps_dir = os.path.join(root, 'OEBPS')
+            break
+    
+    if oebps_dir and os.path.exists(oebps_dir):
+        print("\n=== Applying comprehensive fragment fixing ===")
+        try:
+            # Extract missing fragments
+            fragment_map = extract_missing_fragments(oebps_dir)
+            
+            # Check for missing fragments
+            missing_fragments = {}
+            for target_file, fragments in fragment_map.items():
+                file_path = os.path.join(oebps_dir, target_file)
+                if os.path.exists(file_path):
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                    
+                    # Find existing IDs
+                    existing_ids = set(re.findall(r'id="([^"]+)"', content))
+                    
+                    # Find missing IDs
+                    missing = fragments - existing_ids
+                    if missing:
+                        missing_fragments[target_file] = missing
+            
+            if missing_fragments:
+                print(f"Found missing fragments in {len(missing_fragments)} files")
+                modified_count = add_missing_fragment_ids(oebps_dir, missing_fragments)
+                if modified_count > 0:
+                    print(f"Modified {modified_count} files with missing fragment IDs")
+                    
+        except Exception as e:
+            print(f"Error in comprehensive fragment fixing: {e}")
     
     return fixed_files
 
