@@ -26,6 +26,15 @@ def fix_role_attributes(content):
     
     return content
 
+def fix_epub_type_attributes(content):
+    """Remove epub:type attributes for EPUB 2 compatibility"""
+    print("Fixing epub:type attributes...")
+    
+    # Remove epub:type attributes as they are not allowed in EPUB 2
+    content = re.sub(r'\s*epub:type="[^"]*"', '', content)
+    
+    return content
+
 def fix_section_elements(content):
     """Replace section elements with div elements for EPUB 2 compatibility"""
     print("Fixing section elements...")
@@ -122,6 +131,12 @@ def fix_malformed_xml(content):
     """Fix specific malformed XML syntax errors"""
     print("Fixing malformed XML syntax...")
     
+    # Fix the specific malformed pattern: name="..." / />
+    content = re.sub(r'(<meta[^>]*?)\s+/\s+/>', r'\1 />', content)
+    
+    # Fix charset with malformed ending: charset="utf-8" / />
+    content = re.sub(r'charset="([^"]+)"\s+/\s+/>', r'charset="\1" />', content)
+    
     # Fix the specific malformed charset pattern: charset="UTF-8"/> -> charset="UTF-8" />
     content = re.sub(r'charset="([^"]+)"/>', r'charset="\1" />', content)
     
@@ -134,7 +149,7 @@ def fix_malformed_xml(content):
     # Fix meta tags with malformed syntax like: <meta ... / />
     content = re.sub(r'<meta([^>]*?)\s+/\s+/>', r'<meta\1 />', content)
     
-    # Fix specific malformed meta pattern: name="..."     / />
+    # Fix specific malformed meta pattern: name="..."			/ />
     content = re.sub(r'(<meta[^>]*?)\s+/\s*/>', r'\1 />', content)
     
     # Fix the specific pattern: many spaces followed by / />
@@ -142,6 +157,15 @@ def fix_malformed_xml(content):
     
     # Fix malformed meta tags with extra spaces and slashes
     content = re.sub(r'<meta([^>]*?)\s+/\s*/>', r'<meta\1 />', content)
+    
+    # Fix the specific RSC-016 error pattern: attribute=value" / />
+    content = re.sub(r'([a-zA-Z-]+="[^"]*")\s+/\s+/>', r'\1 />', content)
+    
+    # Fix malformed meta tags with pattern: content="value" / />
+    content = re.sub(r'(<meta[^>]*?content="[^"]*")\s+/\s+/>', r'\1 />', content)
+    
+    # Fix malformed meta tags with pattern: name="value" / />
+    content = re.sub(r'(<meta[^>]*?name="[^"]*")\s+/\s+/>', r'\1 />', content)
     content = re.sub(r'<meta([^>]*?)\s+/\s+/>', r'<meta\1 />', content)
     content = re.sub(r'<meta([^>]*?)\s*/\s*/>', r'<meta\1 />', content)
     
@@ -328,12 +352,75 @@ def fix_css_references(content):
 
 def fix_fragment_identifiers(content):
     """Fix or remove problematic fragment identifier links"""
-    # Remove href attributes that point to non-existent fragments
+    # Fix the specific broken footnote reference in chapter 3
+    # Remove the problematic footnote link that references a non-existent ID
+    content = re.sub(
+        r'<a class="calibre2" href="Gate_9780385546140_epub3_c003_r1\.xhtml#_footnote_referrer_d1-00002c5a" title="footnote reference">\*</a>',
+        '*',
+        content
+    )
+    
+    # Fix broken links in notes files that reference non-existent fragments
+    # Remove problematic links to Y_d1-Photo_page_38 and Y_d1-EndnotePhraseInText14
+    content = re.sub(
+        r'<a href="Gate_9780385546140_epub3_c003_r1\.xhtml#Y_d1-Photo_page_38" class="calibre2">Photo</a>',
+        'Photo',
+        content
+    )
+    
+    content = re.sub(
+        r'<a href="Gate_9780385546140_epub3_c003_r1\.xhtml#Y_d1-EndnotePhraseInText14" class="calibre2">Here\'s the math</a>',
+        'Here\'s the math',
+        content
+    )
+    
+    # Remove href attributes that point to non-existent fragments (general case)
     # Keep the link text but remove the problematic href
     content = re.sub(r'<a href="[^"]*#[^"]*"([^>]*)>([^<]*)</a>', r'\2', content)
     
     # Fix self-referencing links that might be problematic
     content = re.sub(r'href="#[^"]*"', 'href="#"', content)
+    
+    return content
+
+def fix_charset_quotes_in_meta(content):
+    """Fix malformed charset attributes by removing inner quotes"""
+    # Fix the malformed charset pattern: charset="utf-8" -> charset=utf-8
+    content = re.sub(r'charset="utf-8"', 'charset=utf-8', content)
+    content = re.sub(r'charset="UTF-8"', 'charset=UTF-8', content)
+    return content
+
+def fix_missing_quotes_in_content(content):
+    """Fix missing closing quotes in meta tag content attributes"""
+    # Fix missing closing quote in content attribute
+    # Pattern: content="text/html; charset=utf-8 />
+    # Should be: content="text/html; charset=utf-8" />
+    content = re.sub(r'content="text/html; charset=utf-8 />', 'content="text/html; charset=utf-8" />', content)
+    content = re.sub(r'content="text/html; charset=UTF-8 />', 'content="text/html; charset=UTF-8" />', content)
+    return content
+
+def fix_malformed_img_alt_attributes(content):
+    """Fix malformed img tags with broken alt attributes"""
+    # Fix malformed alt attribute pattern: alt=" class="something"
+    # This should be: alt="" class="something"
+    content = re.sub(r'alt="\s+class="([^"]*?)"', r'alt="" class="\1"', content)
+    
+    # Fix other potential malformed patterns
+    content = re.sub(r'alt="([^"]*?)\s+class="([^"]*?)"', r'alt="\1" class="\2"', content)
+    
+    # Ensure all img tags are self-closing
+    content = re.sub(r'<img([^>]*?)(?<!/)>', r'<img\1 />', content)
+    
+    return content
+
+def fix_invalid_id_attributes(content):
+    """Fix invalid ID attributes containing ampersands and other invalid characters"""
+    # Fix ID attributes containing ampersands
+    # Replace &amp; with underscore to make valid XML names
+    content = re.sub(r'id="([^"]*?)&amp;([^"]*?)"', r'id="\1_\2"', content)
+    
+    # Also fix any href references to these IDs
+    content = re.sub(r'href="#([^"]*?)&amp;([^"]*?)"', r'href="#\1_\2"', content)
     
     return content
 
@@ -522,6 +609,50 @@ def add_missing_fragment_ids(directory, missing_fragments):
 
 
 
+def fix_misplaced_anchor_elements(content):
+    """Fix anchor elements that are not allowed in their current context"""
+    print("Fixing misplaced anchor elements...")
+    
+    # Pattern to find anchor elements directly inside body without proper container
+    # Replace with div wrapper
+    content = re.sub(
+        r'(<body[^>]*>)\s*(<a[^>]*>.*?</a>)',
+        r'\1\n<div>\2</div>',
+        content,
+        flags=re.DOTALL
+    )
+    
+    # Fix anchor elements that appear directly after body opening tag
+    # This handles cases where <a> appears immediately after <body> without block container
+    lines = content.split('\n')
+    fixed_lines = []
+    in_body = False
+    body_opened = False
+    
+    for line in lines:
+        if '<body' in line and '>' in line:
+            in_body = True
+            body_opened = True
+            fixed_lines.append(line)
+        elif '</body>' in line:
+            in_body = False
+            body_opened = False
+            fixed_lines.append(line)
+        elif in_body and body_opened and line.strip().startswith('<a '):
+            # Wrap standalone anchor in div
+            fixed_lines.append('<div>')
+            fixed_lines.append(line)
+            fixed_lines.append('</div>')
+            body_opened = False  # Reset flag after first content
+        else:
+            fixed_lines.append(line)
+            if in_body and line.strip() and not line.strip().startswith('<!--'):
+                body_opened = False  # Reset flag after any content
+    
+    content = '\n'.join(fixed_lines)
+    
+    return content
+
 def fix_epub2_compatibility(content):
     """Fix EPUB 2 compatibility issues by removing EPUB 3 features"""
     print("Applying EPUB 2 compatibility fixes...")
@@ -561,6 +692,9 @@ def fix_epub2_compatibility(content):
         '<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">',
         content
     )
+    
+    # Fix misplaced anchor elements
+    content = fix_misplaced_anchor_elements(content)
     
     # Fix text content directly in body elements - wrap in paragraphs
     content = fix_direct_text_in_body(content)
@@ -797,11 +931,13 @@ def fix_xhtml_file(file_path, content, epub_version='epub3'):
     if epub_version.lower() == 'epub2':
         # Apply EPUB 2 compatibility fixes
         content = fix_epub2_compatibility(content)
+        content = fix_epub_type_attributes(content)
     else:
         # Apply EPUB 3 fixes
         content = fix_role_attributes(content)
         content = fix_h1_placement(content)
         content = fix_deprecated_roles(content)
+        content = fix_epub_type_attributes(content)
     
     # Apply common fixes for both EPUB 2 and 3
     content = fix_section_elements(content)
@@ -1262,6 +1398,63 @@ def fix_epub_files(extract_dir, epub_version='epub3'):
                     
         except Exception as e:
             print(f"Error in comprehensive fragment fixing: {e}")
+    
+    return fixed_files
+
+def apply_comprehensive_fixes(content):
+    """Apply all comprehensive fixes to EPUB content"""
+    print("Applying comprehensive fixes...")
+    
+    # Apply all the fixes in order
+    content = fix_malformed_xml(content)
+    content = fix_charset_quotes_in_meta(content)
+    content = fix_missing_quotes_in_content(content)
+    content = fix_malformed_img_alt_attributes(content)
+    content = fix_invalid_id_attributes(content)
+    content = fix_fragment_identifiers(content)
+    content = clean_meta_encoding(content)
+    content = fix_role_attributes(content)
+    content = fix_epub_type_attributes(content)
+    content = fix_section_elements(content)
+    content = fix_incomplete_body_elements(content)
+    content = fix_h1_placement(content)
+    content = fix_deprecated_roles(content)
+    content = fix_malformed_img_tags(content)
+    content = fix_css_references(content)
+    
+    return content
+
+def fix_epub_comprehensive(directory):
+    """Comprehensive EPUB fixing function that applies all fixes"""
+    fixed_files = []
+    
+    for root, dirs, files in os.walk(directory):
+        for file in files:
+            if file.endswith(('.xhtml', '.html', '.ncx', '.opf')):
+                file_path = os.path.join(root, file)
+                
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                    
+                    original_content = content
+                    
+                    # Apply comprehensive fixes
+                    if file.endswith('.ncx'):
+                        content = fix_ncx_file_content(content)
+                    elif file.endswith('.opf'):
+                        content = fix_opf_metadata(content)
+                    else:
+                        content = apply_comprehensive_fixes(content)
+                    
+                    if content != original_content:
+                        with open(file_path, 'w', encoding='utf-8') as f:
+                            f.write(content)
+                        fixed_files.append(file_path)
+                        print(f"Fixed: {os.path.basename(file_path)}")
+                        
+                except Exception as e:
+                    print(f"Error processing {file_path}: {e}")
     
     return fixed_files
 
