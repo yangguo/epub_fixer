@@ -229,4 +229,16 @@ test_*.epub
 sample_*.epub
 demo_*.epub
 
+# IDE and editor settings
+.claude/
+.vscode/
+.idea/
+
+# Generated output files
+output.txt
+validation_results.txt
+
+# Backup files
+*_backup.epub
+*_original.epub
 
