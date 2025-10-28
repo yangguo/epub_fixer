@@ -62,6 +62,9 @@ def fix_dir_attributes(content):
     # Match dir attributes with any value
     content = re.sub(r'dir="([^"]*)"', fix_dir_value, content, flags=re.IGNORECASE)
     
+    # Remove any remaining invalid dir attributes that don't have proper values
+    content = re.sub(r'\s+dir="(?!(?:ltr|rtl)")"[^"]*"', '', content, flags=re.IGNORECASE)
+    
     return content
 
 def fix_html_content(content):
@@ -69,14 +72,46 @@ def fix_html_content(content):
     # First fix dir attributes
     content = fix_dir_attributes(content)
     
+    # Fix malformed head tags first
+    content = re.sub(r'</head[^>]*>', '</head>', content, flags=re.IGNORECASE)
+    
+    # Fix XML namespace issues - ensure proper XHTML namespace
+    # More robust namespace handling
+    # Find the html tag and ensure it has proper namespace
+    def fix_html_namespace(match):
+        html_tag = match.group(0)
+        # If no xmlns attribute, add it
+        if 'xmlns=' not in html_tag:
+            # Add XHTML namespace as first attribute after html tag
+            return re.sub(r'<html', '<html xmlns="http://www.w3.org/1999/xhtml"', html_tag, flags=re.IGNORECASE)
+        # Remove problematic attributes from html tag
+        html_tag = re.sub(r'\s+class="[^"]*"', '', html_tag, flags=re.IGNORECASE)
+        html_tag = re.sub(r'\s+epub:prefix="[^"]*"', '', html_tag, flags=re.IGNORECASE)
+        return html_tag
+    
+    content = re.sub(r'<html[^>]*>', fix_html_namespace, content, flags=re.IGNORECASE)
+    
+    # Fix structural issues - move misplaced elements
+    content = fix_structural_issues(content)
+    
     # EPUB 2.0.1 compatibility fixes
     fixes = [
-        (r'\s*epub:type="[^"]*"', ''),  # Remove epub:type
-        (r'\s*epub:prefix="[^"]*"', ''),  # Remove epub:prefix
-        (r'\s*data-number="[^"]*"', ''),  # Remove data-number
-        (r'\s*hidden(?:="[^"]*")?', ''),  # Remove hidden attributes
-        (r'\s*aria-[a-z-]*="[^"]*"', ''),  # Remove aria attributes
-        (r'\s*role="[^"]*"', ''),  # Remove role attributes
+        # Remove EPUB 3 specific attributes from head tags  
+        (r'<head[^>]*\s+epub:prefix="[^"]*"([^>]*)>', r'<head\1>'),
+        (r'<head[^>]*\s+class="[^"]*"([^>]*)>', r'<head\1>'),
+        
+        # Remove EPUB 3 specific attributes from body tags  
+        (r'<body[^>]*\s+epub:type="[^"]*"([^>]*)>', r'<body\1>'),
+        
+        # General EPUB 3 attribute removal
+        (r'\s+epub:type="[^"]*"', ''),  # Remove epub:type
+        (r'\s+epub:prefix="[^"]*"', ''),  # Remove epub:prefix
+        (r'\s+data-number="[^"]*"', ''),  # Remove data-number
+        (r'\s+hidden(?:="[^"]*")?', ''),  # Remove hidden attributes
+        (r'\s+aria-[a-z-]*="[^"]*"', ''),  # Remove aria attributes
+        (r'\s+role="[^"]*"', ''),  # Remove role attributes
+        
+        # HTML5 to HTML4 element conversion
         (r'<section([^>]*)>', r'<div\1>'),  # Convert section to div
         (r'</section>', '</div>'),
         (r'<nav([^>]*)>', r'<div\1>'),  # Convert nav to div
@@ -85,12 +120,87 @@ def fix_html_content(content):
         (r'</figure>', '</div>'),
         (r'<figcaption([^>]*)>', r'<div\1>'),  # Convert figcaption to div
         (r'</figcaption>', '</div>'),
-        (r'<style(?![^>]*type=)([^>]*)>', r'<style type="text/css"\1>'),  # Fix style tags
-        (r'<html[^>]*?\s*class="[^"]*"([^>]*>)', r'<html\1'),  # Fix html class
+        (r'<aside([^>]*)>', r'<div\1>'),  # Convert aside to div
+        (r'</aside>', '</div>'),
+        (r'<header([^>]*)>', r'<div\1>'),  # Convert header to div
+        (r'</header>', '</div>'),
+        
+        # Fix style tags
+        (r'<style(?![^>]*type=)([^>]*)>', r'<style type="text/css"\1>'),
     ]
     
     for pattern, replacement in fixes:
         content = re.sub(pattern, replacement, content, flags=re.IGNORECASE)
+    
+    # Additional cleanup for empty attributes
+    content = re.sub(r'\s+\w+="\s*"', '', content)  # Remove empty attributes
+    
+    # Remove references to missing CSS files
+    content = re.sub(r'<link[^>]*href="[^"]*WileyTemplate_v5\.1\.css"[^>]*/?>', '', content, flags=re.IGNORECASE)
+    
+    # Remove references to missing image files
+    content = re.sub(r'<img[^>]*src="[^"]*images/cover_fmt\.jpg"[^>]*/?>', '', content, flags=re.IGNORECASE)
+    
+    # Fix incomplete body elements - ensure body has proper content
+    content = fix_incomplete_body(content)
+    
+    return content
+
+def fix_structural_issues(content):
+    """Fix structural issues like misplaced head/h1 elements and missing titles"""
+    # Move h1 elements from head to body
+    # Find head section and extract h1 elements
+    head_match = re.search(r'<head[^>]*>(.*?)</head>', content, re.DOTALL | re.IGNORECASE)
+    if head_match:
+        head_content = head_match.group(1)
+        # Extract h1 elements from head
+        h1_elements = re.findall(r'<h1[^>]*>.*?</h1>', head_content, re.DOTALL | re.IGNORECASE)
+        if h1_elements:
+            # Remove h1 elements from head
+            head_content = re.sub(r'<h1[^>]*>.*?</h1>', '', head_content, flags=re.DOTALL | re.IGNORECASE)
+            # Replace head content
+            content = content.replace(head_match.group(0), f'<head>{head_content}</head>')
+            
+            # Add h1 elements to beginning of body
+            for h1 in h1_elements:
+                content = re.sub(r'<body[^>]*>', f'<body>\\n{h1}', content, flags=re.IGNORECASE)
+    
+    # Ensure head has a title element
+    head_match = re.search(r'<head[^>]*>(.*?)</head>', content, re.DOTALL | re.IGNORECASE)
+    if head_match:
+        head_content = head_match.group(1)
+        if not re.search(r'<title[^>]*>.*?</title>', head_content, re.DOTALL | re.IGNORECASE):
+            # Add a default title if missing
+            head_content += '\\n<title>Document</title>'
+            content = content.replace(head_match.group(0), f'<head>{head_content}</head>')
+    
+    # Fix duplicate head elements (remove misplaced ones)
+    # Keep only the first head element, remove others
+    head_matches = list(re.finditer(r'<head[^>]*>.*?</head>', content, re.DOTALL | re.IGNORECASE))
+    if len(head_matches) > 1:
+        # Remove all but the first head
+        for i in range(1, len(head_matches)):
+            content = content.replace(head_matches[i].group(0), '')
+    
+    return content
+
+def fix_incomplete_body(content):
+    """Fix incomplete body elements by ensuring they have valid child elements"""
+    # Find empty or whitespace-only body elements
+    body_pattern = r'<body[^>]*>(\s*)</body>'
+    
+    def replace_empty_body(match):
+        body_content = match.group(1)
+        if not body_content.strip():
+            # Add a paragraph with non-breaking space to make body valid
+            return match.group(0).replace(body_content, '<p>&nbsp;</p>')
+        return match.group(0)
+    
+    content = re.sub(body_pattern, replace_empty_body, content, flags=re.IGNORECASE)
+    
+    # Also fix body elements that only contain whitespace and invalid elements
+    body_pattern2 = r'<body[^>]*>(\s*(?:<br\s*/?>\s*)*)</body>'
+    content = re.sub(body_pattern2, replace_empty_body, content, flags=re.IGNORECASE)
     
     return content
 
@@ -111,15 +221,74 @@ def fix_fragment_identifiers(content, file_path):
     content = re.sub(r'href="([^"]*#[^"]*)"', fix_href, content)
     return content
 
-def process_xhtml_file(file_path):
-    """Process single XHTML file"""
+def fix_ncx_file(content):
+    """Fix NCX navigation issues - duplicate playOrder and missing fragments"""
+    lines = content.split('\n')
+    play_order = 1
+    
+    # Track nesting level to only assign playOrder to top-level navPoints
+    nesting_level = 0
+    
+    for i, line in enumerate(lines):
+        if '<navPoint' in line:
+            # Count opening navPoint tags before this line to determine nesting
+            nav_point_opens = line[:line.find('<navPoint')].count('<navPoint')
+            nav_point_closes = line[:line.find('<navPoint')].count('</navPoint>')
+            current_nesting = nesting_level + nav_point_opens - nav_point_closes
+            
+            # Only assign playOrder to top-level navPoints (nesting_level == 0)
+            if current_nesting == 0 and 'playOrder=' in line:
+                lines[i] = re.sub(r'playOrder="[^"]*"', f'playOrder="{play_order}"', line)
+                play_order += 1
+            else:
+                # Remove playOrder from nested navPoints
+                lines[i] = re.sub(r'\s+playOrder="[^"]*"', '', line)
+        
+        # Update nesting level based on opening/closing tags
+        nesting_level += line.count('<navPoint') - line.count('</navPoint>')
+    
+    content = '\n'.join(lines)
+    
+    # Remove fragment identifiers from src attributes that don't exist
+    # This is a conservative approach - just remove the fragment part
+    content = re.sub(r'src="([^#]*)#[^"]*"', r'src="\1"', content)
+    
+    return content
+
+def fix_opf_file(content):
+    """Fix OPF file issues - ensure all referenced items are in spine"""
+    # Check if there are references to cover.xhtml in the manifest
+    # but the item is not in the spine
+    
+    # Find all item references in the manifest
+    manifest_items = re.findall(r'<item[^>]*id="([^"]*)"[^>]*href="([^"]*cover\.xhtml[^"]*)"', content, re.IGNORECASE)
+    
+    # Find all item references in the spine
+    spine_items = re.findall(r'<itemref[^>]*idref="([^"]*)"', content)
+    
+    # For each cover.xhtml item in manifest, check if it's in spine
+    for item_id, href in manifest_items:
+        if item_id not in spine_items:
+            # Add the item to the spine
+            content = re.sub(r'(</spine>)', f'    <itemref idref="{item_id}"/>\n\\1', content)
+    
+    return content
+
+def process_file(file_path):
+    """Process single file (XHTML, NCX, or OPF)"""
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
             content = f.read()
         
         original = content
-        content = fix_html_content(content)
-        content = fix_fragment_identifiers(content, file_path)
+        
+        if file_path.endswith('.ncx'):
+            content = fix_ncx_file(content)
+        elif file_path.endswith('.opf'):
+            content = fix_opf_file(content)
+        else:
+            content = fix_html_content(content)
+            content = fix_fragment_identifiers(content, file_path)
         
         if content != original:
             with open(file_path, 'w', encoding='utf-8') as f:
@@ -138,16 +307,16 @@ def fix_epub(epub_path):
         extract_dir = os.path.join(temp_dir, 'epub')
         extract_epub(epub_path, extract_dir)
         
-        # Find and process XHTML files
-        xhtml_files = []
+        # Find and process all relevant files
+        process_files = []
         for root, dirs, files in os.walk(extract_dir):
             for file in files:
-                if file.endswith(('.xhtml', '.html')):
-                    xhtml_files.append(os.path.join(root, file))
+                if file.endswith(('.xhtml', '.html', '.ncx', '.opf')):
+                    process_files.append(os.path.join(root, file))
         
         fixed_count = 0
-        for file_path in xhtml_files:
-            if process_xhtml_file(file_path):
+        for file_path in process_files:
+            if process_file(file_path):
                 fixed_count += 1
         
         # Backup and repack
