@@ -223,6 +223,9 @@ temp/
 tmp/
 fixed/
 processed/
+temp_inspect/
+temp_test/
+-p/
 
 # Test files
 test_*.epub

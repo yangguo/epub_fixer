@@ -1,47 +1,43 @@
 #!/usr/bin/env python3
-"""
-Simple EPUB validator
-"""
+"""Simple EPUB validation script"""
 
-import subprocess
 import sys
 import os
 
-def validate_epub(epub_path):
-    """Validate EPUB using epubcheck"""
-    if not os.path.exists('epubcheck.jar'):
-        print("❌ epubcheck.jar not found")
-        return False
-    
-    print(f"🔍 Validating: {epub_path}")
-    try:
-        result = subprocess.run(
-            ['java', '-jar', 'epubcheck.jar', epub_path],
-            capture_output=True, text=True, cwd='.'
-        )
-        
-        output = result.stdout + result.stderr
-        error_count = output.count('ERROR(')
-        warning_count = output.count('WARNING(')
-        
-        if error_count == 0:
-            print(f"✅ Valid EPUB ({warning_count} warnings)")
-            return True
-        else:
-            print(f"❌ {error_count} errors, {warning_count} warnings")
-            return False
-            
-    except Exception as e:
-        print(f"❌ Validation error: {e}")
-        return False
+from utils import run_epubcheck, count_errors
 
 def main():
+    """Main function"""
     if len(sys.argv) != 2:
-        print("Usage: python validate_epub.py <epub_file>")
-        return
+        print(f"Usage: python {sys.argv[0]} <epub_file>")
+        sys.exit(1)
     
     epub_path = sys.argv[1]
-    validate_epub(epub_path)
+    if not os.path.exists(epub_path):
+        print(f"Error: File not found - {epub_path}")
+        sys.exit(1)
+    
+    if not os.path.exists("epubcheck.jar"):
+        print("Error: epubcheck.jar not found in current directory")
+        sys.exit(1)
+    
+    print(f"Validating: {epub_path}")
+    print("=" * 60)
+    
+    output = run_epubcheck(epub_path)
+    
+    # Count errors and warnings
+    error_count, warning_count = count_errors(output)
+    
+    print(output)
+    print("=" * 60)
+    
+    if error_count == 0:
+        print(f"✓ SUCCESS: No errors found (Warnings: {warning_count})")
+        sys.exit(0)
+    else:
+        print(f"✗ FAILURE: {error_count} errors, {warning_count} warnings found")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()

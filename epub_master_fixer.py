@@ -18,34 +18,15 @@ Successfully tested on college1.epub - fixes all 93 errors in one pass.
 import os
 import re
 import zipfile
+
+from utils import run_epubcheck, count_errors
 import shutil
 import sys
 import tempfile
 import subprocess
 from pathlib import Path
 
-def run_epubcheck(epub_path):
-    """Run epubcheck and return output"""
-    # Try different Java locations
-    java_paths = [
-        'java',  # System PATH
-        '/mnt/c/Program Files/Java/jdk-24/bin/java.exe',  # Windows WSL
-        'C:\\Program Files\\Java\\jdk-24\\bin\\java.exe',  # Windows native
-    ]
-    
-    for java_path in java_paths:
-        try:
-            result = subprocess.run(
-                [java_path, '-jar', 'epubcheck.jar', epub_path],
-                capture_output=True, text=True, cwd='.', timeout=60
-            )
-            return result.stdout + result.stderr
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            continue
-        except Exception as e:
-            continue
-    
-    return "epubcheck could not be run (Java not found)"
+
 
 def extract_epub(epub_path, extract_dir):
     """Extract EPUB with proper structure"""
@@ -90,10 +71,59 @@ def fix_dir_attributes(content):
     
     return content
 
+def fix_unclosed_p_tags(content):
+    """Fix unclosed p tags that cause fatal parsing errors"""
+    # PREPROCESSING: Fix mangled tags first
+    # 1. Fix tags like </p>s="author1"> which is invalid
+    content = re.sub(r'</p>\s*s="([^"]*)">', r'<p class="\1">', content)
+    
+    # Now proceed with aggressive p tag fixing
+    # Count the number of opening and closing p tags
+    open_tags = len(re.findall(r'<p[^>]*(?<!/)>', content, flags=re.IGNORECASE))
+    close_tags = len(re.findall(r'</p>', content, flags=re.IGNORECASE))
+    
+    # If there are more open tags than closing tags, add closing tags
+    if open_tags > close_tags:
+        # Add closing tags at the end of the body
+        num_to_add = open_tags - close_tags
+        content = re.sub(r'</body>', '</p>' * num_to_add + '</body>', content, flags=re.IGNORECASE)
+    elif close_tags > open_tags:
+        # Remove extra closing tags
+        p_tags = list(re.finditer(r'</p>', content, flags=re.IGNORECASE))
+        extra_tags = close_tags - open_tags
+        for tag in p_tags[-extra_tags:]:
+            content = content[:tag.start()] + content[tag.end():]
+    
+    # Additional heuristic: Close all p tags before any block-level tag
+    block_elements = ['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'div', 'ul', 'ol', 'li', \
+                     'blockquote', 'table', 'tr', 'td', 'th', 'pre', 'hr', 'br',\
+                     'form', 'input', 'select', 'textarea', 'button', 'img']
+    
+    for elem in block_elements:
+        # Close p tag before opening a new block element
+        content = re.sub(
+            r'(?<!</p>)\s*(<p[^>]*>.*?)\s*<'+elem, 
+            r'\1</p><'+elem, 
+            content, 
+            flags=re.DOTALL | re.IGNORECASE
+        )
+    
+    return content
+
+def fix_mangled_p_tags(content):
+    '''Fix mangled p tags like <ppubli... which should be <p class="publi...'''
+    # Fix tags like <ppubli -> <p class="publi", <pcopyr -> <p class="copyr", etc.
+    # Matches <p followed by lowercase letters/numbers (common class names)
+    return re.sub(r'<p([a-z0-9]+)', r'<p class="\1"', content)
+
 def fix_html_content(content):
     """Apply all HTML fixes in one pass"""
-    # CRITICAL: Fix unclosed anchor tags FIRST - this causes fatal parsing errors
+    # CRITICAL: Fix mangled tags FIRST - these cause fatal parsing errors
+    content = fix_mangled_p_tags(content)
+    
+    # Then fix unclosed tags
     content = fix_unclosed_anchor_tags(content)
+    content = fix_unclosed_p_tags(content)
     
     # First fix dir attributes
     content = fix_dir_attributes(content)
@@ -172,6 +202,38 @@ def fix_html_content(content):
     
     # Fix incomplete body elements - ensure body has proper content
     content = fix_incomplete_body(content)
+    
+    # Fix missing </body> tags - more robust version
+    # Make sure there's a closing </body> tag for every opening <body> tag
+    body_open = len(re.findall(r'<body[^>]*(?<!/)>', content, flags=re.IGNORECASE))
+    body_close = len(re.findall(r'</body>', content, flags=re.IGNORECASE))
+    
+    if body_close < body_open:
+        missing_closes = body_open - body_close
+        closes_to_add = '</body>' * missing_closes
+        
+        # Try multiple strategies to add the closing tags
+        if '</html>' in content:
+            # Add before </html> if present
+            content = re.sub(\
+                r'(</html>)', \
+                r'</body>' * missing_closes + r'\\1', \
+                content, \
+                flags=re.IGNORECASE\
+            )
+        elif '</head>' in content:
+            # If no </html>, but there's a </head>, add at the end
+            content = content.rstrip() + r'</body></html>'
+        else:
+            # Last resort: add at the end
+            content = content.rstrip() + closes_to_add
+            
+        # Verify the fix worked
+        body_close_new = len(re.findall(r'</body>', content, flags=re.IGNORECASE))
+        if body_close_new < body_open:
+            # If still missing, add exactly where needed using more precise regex
+            # Find the first opening body tag and insert closing tag at the end
+            content = content.rstrip() + r'</body>'
     
     return content
 
@@ -539,28 +601,27 @@ def validate_and_fix(epub_path, max_iterations=5):
     if not os.path.exists('epubcheck.jar'):
         print("❌ epubcheck.jar not found")
         return False
-    
+
     for iteration in range(1, max_iterations + 1):
         print(f"\n🔄 Iteration {iteration}")
-        
+
         output = run_epubcheck(epub_path)
-        error_count = output.count('ERROR(')
-        
+        error_count = output.count('ERROR(') + output.count('FATAL(')  # Also count FATAL errors
+
         if error_count == 0:
             print("✅ EPUB is valid!")
             return True
-        
+
         print(f"📊 Found {error_count} errors, fixing...")
-        
+
         # Save current output for analysis
         with open('output.txt', 'w', encoding='utf-8') as f:
             f.write(output)
-        
+
         fix_epub(epub_path)
-    
+
     print("⚠️  Max iterations reached, check remaining errors")
     return False
-
 def main():
     """Command line interface"""
     if len(sys.argv) != 2:
