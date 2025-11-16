@@ -48,6 +48,25 @@ def repack_epub(extract_dir, epub_path):
                 arc_path = os.path.relpath(file_path, extract_dir)
                 zip_ref.write(file_path, arc_path)
 
+def build_fragment_index(extract_dir):
+    """Collect ID fragments for each HTML-like file to validate NCX references."""
+    fragment_index = {}
+    for root, _, files in os.walk(extract_dir):
+        for file in files:
+            if not file.lower().endswith(('.xhtml', '.html', '.xml')):
+                continue
+            file_path = os.path.join(root, file)
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+            except (UnicodeDecodeError, FileNotFoundError):
+                continue
+            if '<html' not in content.lower():
+                continue
+            rel_path = os.path.relpath(file_path, extract_dir).replace('\\', '/')
+            fragment_index[rel_path] = set(re.findall(r'id="([^"]+)"', content))
+    return fragment_index
+
 def fix_dir_attributes(content):
     """Fix invalid dir attribute values"""
     # Fix dir attributes with invalid values - replace with "ltr" or remove entirely
@@ -275,11 +294,11 @@ def fix_structural_issues(content):
 
 def fix_malformed_sup_tags(content):
     """Fix malformed sup tags like <sup>text</a></sup> -> <sup>text</sup>"""
-    # Pattern: <sup ...>content</a></sup> should be <sup ...>content</sup>
-    content = re.sub(r'<sup([^>]*)>([^<]*)</a></sup>', r'<sup\1>\2</sup>', content)
+    # Pattern: <sup ...>content</a></sup> should drop the stray </a>
+    content = re.sub(r'<sup([^>]*)>([^<]*)</a></sup>', r'<sup\1>\2</sup>', content, flags=re.IGNORECASE)
     
-    # Also fix <sup>...<a>...</a></a></sup> patterns
-    content = re.sub(r'<sup([^>]*)>(.*?)</a></sup>', r'<sup\1>\2</sup>', content, flags=re.DOTALL)
+    # Remove duplicate closing anchors (</a></a></sup> -> </a></sup>)
+    content = re.sub(r'</a></a></sup>', r'</a></sup>', content, flags=re.IGNORECASE)
     
     return content
 
@@ -305,24 +324,95 @@ def fix_incomplete_body(content):
 
 def fix_unclosed_anchor_tags(content):
     """Fix unclosed anchor tags that cause parsing errors"""
-    # Pattern 1: <sup><a href="...">text</sup> should be <sup><a href="...">text</a></sup>
-    content = re.sub(r'<sup><a\s+([^>]*)>([^<]*)</sup>', r'<sup><a \1>\2</a></sup>', content)
-    
-    # Pattern 2: <a id="..."></a><sup><a href="...">N</sup> -> <a id="..."></a><sup><a href="...">N</a></sup>
+    # Pattern 1: <sup ...><a href="...">text</sup> -> ensure </a>
     content = re.sub(
-        r'(<a\s+id="[^"]*"></a>)<sup><a\s+([^>]*)>([^<]*)</sup>',
-        r'\1<sup><a \2>\3</a></sup>',
-        content
+        r'<sup([^>]*)><a\s+([^>]*)>([^<]*)</sup>',
+        r'<sup\1><a \2>\3</a></sup>',
+        content,
+        flags=re.IGNORECASE
+    )
+    # Pattern 1b: <sup ...><a id...></a><a href...>text</sup>
+    content = re.sub(
+        r'(<sup[^>]*>(?:\s*<a\b[^>]*></a>\s*)*)<a\s+([^>]*)>([^<]*)</sup>',
+        r'\1<a \2>\3</a></sup>',
+        content,
+        flags=re.IGNORECASE
     )
     
-    # Pattern 3: Generic pattern for <tag><a ...>content</tag> -> <tag><a ...>content</a></tag>
+    # Pattern 2: <a id="..."></a><sup ...><a href="...">N</sup> -> close anchor
+    content = re.sub(
+        r'(<a\s+id="[^"]*"></a>)<sup([^>]*)><a\s+([^>]*)>([^<]*)</sup>',
+        r'\1<sup\2><a \3>\4</a></sup>',
+        content,
+        flags=re.IGNORECASE
+    )
+    
+    # Pattern 3: Inline tags that wrap anchors without closing </a>
     tags_to_check = ['sup', 'em', 'strong', 'i', 'b']
     for tag in tags_to_check:
-        pattern = f'<{tag}><a\\s+([^>]*)>([^<]*)</{tag}>'
-        replacement = f'<{tag}><a \\1>\\2</a></{tag}>'
-        content = re.sub(pattern, replacement, content)
+        pattern = re.compile(fr'(<{tag}[^>]*>)(\s*<a\b[^>]*>[^<]*)(</{tag}>)', re.IGNORECASE)
+        def repl(match):
+            opening, anchor_chunk, closing = match.groups()
+            if '</a>' in anchor_chunk.lower():
+                return match.group(0)
+            return f"{opening}{anchor_chunk}</a>{closing}"
+        content = pattern.sub(repl, content)
+    
+    # Generic fallback: ensure anchors close before major block-level closings
+    content = close_anchor_before_block(content)
+    
+    # Balance anchor counts (remove stray </a> and close missing </a>)
+    content = balance_anchor_tags(content)
+    return content
+
+def close_anchor_before_block(content):
+    """Insert </a> before block-level closing tags when missing."""
+    block_pattern = re.compile(
+        r'(<a\b[^>]*>)([^<]*?)(</(?:sup|em|strong|i|b|span|p|div|li|h[1-6]|blockquote)>)',
+        re.IGNORECASE
+    )
+    
+    while True:
+        updated = block_pattern.sub(lambda m: f"{m.group(1)}{m.group(2)}</a>{m.group(3)}", content)
+        if updated == content:
+            break
+        content = updated
     
     return content
+
+def balance_anchor_tags(content):
+    """Remove stray </a> tags and close any remaining open anchors."""
+    pattern = re.compile(r'<a\b[^>]*>|</a>', re.IGNORECASE)
+    segments = []
+    last_index = 0
+    open_count = 0
+    
+    for match in pattern.finditer(content):
+        segments.append(content[last_index:match.start()])
+        token = match.group(0)
+        if token.lower().startswith('</a'):
+            if open_count > 0:
+                open_count -= 1
+                segments.append(token)
+            else:
+                # Skip unmatched closing anchor
+                pass
+        else:
+            open_count += 1
+            segments.append(token)
+        last_index = match.end()
+    
+    segments.append(content[last_index:])
+    balanced = ''.join(segments)
+    
+    if open_count > 0:
+        replacement = '</a>' * open_count
+        if '</body>' in balanced:
+            balanced = balanced.replace('</body>', replacement + '</body>', 1)
+        else:
+            balanced = balanced + replacement
+    
+    return balanced
 
 def wrap_blockquote_text(content):
     """Wrap direct blockquote text in <p> tags to satisfy EPUB 2 content model."""
@@ -413,7 +503,7 @@ def fix_ncx_identifier(content, opf_content=None):
             )
     return content
 
-def fix_ncx_file(content, opf_content=None):
+def fix_ncx_file(content, opf_content=None, fragment_index=None, current_path=None):
     """Fix NCX navigation issues - IDs with colons, playOrder, and pageList class"""
     
     # Fix NCX identifier to match OPF
@@ -498,6 +588,29 @@ def fix_ncx_file(content, opf_content=None):
     
     content = '\n'.join(lines)
     
+    # Remove fragment identifiers that point to missing anchors
+    if fragment_index is not None and current_path is not None:
+        base_dir = os.path.dirname(current_path)
+        def fix_content_src(match):
+            prefix, src_value, suffix = match.groups()
+            if '#' not in src_value:
+                return match.group(0)
+            file_part, fragment = src_value.split('#', 1)
+            fragment = fragment.strip()
+            normalized_target = os.path.normpath(
+                os.path.join(base_dir, file_part)
+            ).replace('\\', '/')
+            ids = fragment_index.get(normalized_target)
+            if not fragment or not ids or fragment not in ids:
+                return f'{prefix}{file_part}{suffix}'
+            return match.group(0)
+        content = re.sub(
+            r'(<content\s+src=")([^"]*)(")',
+            fix_content_src,
+            content,
+            flags=re.IGNORECASE
+        )
+    
     return content
 
 def fix_opf_file(content):
@@ -554,16 +667,19 @@ def fix_missing_file_references(content):
 
     return content
 
-def process_file(file_path, opf_content=None):
+def process_file(file_path, opf_content=None, fragment_index=None, root_dir=None):
     """Process single file (XHTML, NCX, or OPF)"""
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
             content = f.read()
         
         original = content
+        rel_path = None
+        if root_dir:
+            rel_path = os.path.relpath(file_path, root_dir).replace('\\', '/')
         
         if file_path.endswith('.ncx'):
-            content = fix_ncx_file(content, opf_content)
+            content = fix_ncx_file(content, opf_content, fragment_index, rel_path)
             # Fix duplicate class attributes specifically for NCX
             lines = content.split('\n')
             for i, line in enumerate(lines):
@@ -584,6 +700,8 @@ def process_file(file_path, opf_content=None):
             # Fix fragment identifiers in OPF
             content = re.sub(r'href="([^#]*)#[^"]*"', r'href="\1"', content)
         else:
+            if file_path.endswith('.xml') and '<html' not in content.lower():
+                return False
             content = fix_html_content(content)
             content = fix_fragment_identifiers(content, file_path)
             # Remove references to missing files
@@ -619,16 +737,19 @@ def fix_epub(epub_path):
             if opf_content:
                 break
         
+        # Build fragment index for validating NCX fragment references
+        fragment_index = build_fragment_index(extract_dir)
+        
         # Find and process all relevant files
         process_files = []
         for root, dirs, files in os.walk(extract_dir):
             for file in files:
-                if file.endswith(('.xhtml', '.html', '.ncx', '.opf')):
+                if file.endswith(('.xhtml', '.html', '.ncx', '.opf', '.xml')):
                     process_files.append(os.path.join(root, file))
         
         fixed_count = 0
         for file_path in process_files:
-            if process_file(file_path, opf_content):
+            if process_file(file_path, opf_content, fragment_index, extract_dir):
                 fixed_count += 1
         
         # Backup and repack

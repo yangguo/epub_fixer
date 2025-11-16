@@ -14,10 +14,14 @@ try:
     from epub_master_fixer import (
         wrap_blockquote_text as master_wrap_blockquote_text,
         ensure_image_alt_attributes as master_ensure_image_alt_attributes,
+        fix_unclosed_anchor_tags as master_fix_unclosed_anchor_tags,
+        fix_unclosed_p_tags as master_fix_unclosed_p_tags,
     )
 except ImportError:
     master_wrap_blockquote_text = None
     master_ensure_image_alt_attributes = None
+    master_fix_unclosed_anchor_tags = None
+    master_fix_unclosed_p_tags = None
 
 class CustomFixAgent(BaseAgent):
     """Agent that uses LLM to generate custom fixes for persistent errors"""
@@ -42,7 +46,7 @@ class CustomFixAgent(BaseAgent):
         
         # 2. Extract detailed error information
         error_details = self.llm_brain.extract_error_details(validation_output, max_errors=20)
-        issue_flags = self._detect_issue_flags(error_details)
+        issue_flags, issue_files = self._detect_issue_flags(error_details)
         
         if not error_details:
             self.result["success"] = True
@@ -77,6 +81,34 @@ class CustomFixAgent(BaseAgent):
             if issue_flags["missing_alt"]:
                 self.log("info", "Adding fallback alt text to <img> tags...")
                 if self._fix_missing_alt_attributes(extract_dir):
+                    fixed_count += 1
+                    error_processed = True
+
+            anchor_files = issue_files.get("unclosed_anchor", set())
+            if anchor_files:
+                self.log("info", f"Closing open <a> tags in {len(anchor_files)} file(s)...")
+                if self._fix_unclosed_anchor_tags(extract_dir, anchor_files):
+                    fixed_count += 1
+                    error_processed = True
+
+            p_files = issue_files.get("unclosed_p", set())
+            if p_files:
+                self.log("info", f"Balancing <p> tags in {len(p_files)} file(s)...")
+                if self._fix_unclosed_p_tags(extract_dir, p_files):
+                    fixed_count += 1
+                    error_processed = True
+
+            cover_files = issue_files.get("cover_attr", set())
+            if cover_files:
+                self.log("info", "Cleaning invalid attributes from cover files...")
+                if self._fix_cover_attributes(extract_dir, cover_files):
+                    fixed_count += 1
+                    error_processed = True
+
+            toc_files = issue_files.get("missing_fragment", set())
+            if toc_files:
+                self.log("info", "Repairing NCX fragment identifiers...")
+                if self._fix_missing_fragments(extract_dir, toc_files):
                     fixed_count += 1
                     error_processed = True
 
@@ -269,17 +301,36 @@ Return ONLY valid JSON, no markdown.
         shutil.copy2(new_path, original_path)
         os.remove(new_path)
 
-    def _detect_issue_flags(self, error_details: list) -> dict:
+    def _detect_issue_flags(self, error_details: list) -> tuple[dict, dict]:
         """Detect common issue categories that we can fix deterministically."""
-        flags = {"missing_body": False, "blockquote": False, "missing_alt": False}
+        flags = {
+            "missing_body": False,
+            "blockquote": False,
+            "missing_alt": False,
+        }
+        file_map = {
+            "unclosed_anchor": set(),
+            "unclosed_p": set(),
+            "cover_attr": set(),
+            "missing_fragment": set(),
+        }
         for error in error_details or []:
+            file_path = self._normalize_error_path(error.get("file"))
             if self._is_body_error(error):
                 flags["missing_body"] = True
             if self._is_blockquote_error(error):
                 flags["blockquote"] = True
             if self._is_missing_alt_error(error):
                 flags["missing_alt"] = True
-        return flags
+            if self._is_unclosed_anchor_error(error) and file_path:
+                file_map["unclosed_anchor"].add(file_path)
+            if self._is_unclosed_p_error(error) and file_path:
+                file_map["unclosed_p"].add(file_path)
+            if self._is_cover_attr_error(error) and file_path:
+                file_map["cover_attr"].add(file_path)
+            if self._is_missing_fragment_error(error) and file_path:
+                file_map["missing_fragment"].add(file_path)
+        return flags, file_map
 
     def _is_body_error(self, error: dict) -> bool:
         message = (error.get("message") or "").lower()
@@ -294,6 +345,23 @@ Return ONLY valid JSON, no markdown.
     def _is_missing_alt_error(self, error: dict) -> bool:
         message = (error.get("message") or "").lower()
         return "alt attribute" in message or "alt text" in message
+
+    def _is_unclosed_anchor_error(self, error: dict) -> bool:
+        message = (error.get("message") or "").lower()
+        return 'element type "a"' in message and "terminated" in message
+
+    def _is_unclosed_p_error(self, error: dict) -> bool:
+        message = (error.get("message") or "").lower()
+        return 'element type "p"' in message and "terminated" in message
+
+    def _is_cover_attr_error(self, error: dict) -> bool:
+        message = (error.get("message") or "").lower()
+        file_path = (error.get("file") or "").lower()
+        return "cover" in file_path and "attribute" in message and '"class"' in message
+
+    def _is_missing_fragment_error(self, error: dict) -> bool:
+        message = (error.get("message") or "").lower()
+        return "fragment identifier is not defined" in message
 
     def _fix_missing_body_tags(self, extract_dir: str) -> bool:
         """Add </body> tags when they're missing."""
@@ -345,9 +413,125 @@ Return ONLY valid JSON, no markdown.
                 modified = True
         return modified
 
+    def _fix_unclosed_anchor_tags(self, extract_dir: str, files: set[str]) -> bool:
+        if master_fix_unclosed_anchor_tags is None or not files:
+            return False
+        modified = False
+        for rel_path in files:
+            full_path = os.path.join(extract_dir, rel_path)
+            if not os.path.exists(full_path):
+                continue
+            try:
+                with open(full_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+            except UnicodeDecodeError:
+                continue
+            updated = master_fix_unclosed_anchor_tags(content)
+            if updated != content:
+                with open(full_path, "w", encoding="utf-8") as f:
+                    f.write(updated)
+                modified = True
+        return modified
+
+    def _fix_unclosed_p_tags(self, extract_dir: str, files: set[str]) -> bool:
+        if master_fix_unclosed_p_tags is None or not files:
+            return False
+        modified = False
+        for rel_path in files:
+            full_path = os.path.join(extract_dir, rel_path)
+            if not os.path.exists(full_path):
+                continue
+            try:
+                with open(full_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+            except UnicodeDecodeError:
+                continue
+            updated = master_fix_unclosed_p_tags(content)
+            if updated != content:
+                with open(full_path, "w", encoding="utf-8") as f:
+                    f.write(updated)
+                modified = True
+        return modified
+
+    def _fix_cover_attributes(self, extract_dir: str, files: set[str]) -> bool:
+        modified = False
+        for rel_path in files:
+            full_path = os.path.join(extract_dir, rel_path)
+            if not os.path.exists(full_path):
+                continue
+            try:
+                with open(full_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+            except UnicodeDecodeError:
+                continue
+            updated = re.sub(r'(<html[^>]*?)\s+class="[^"]*"', r'\1', content, flags=re.IGNORECASE)
+            if updated != content:
+                with open(full_path, "w", encoding="utf-8") as f:
+                    f.write(updated)
+                modified = True
+        return modified
+
+    def _fix_missing_fragments(self, extract_dir: str, files: set[str]) -> bool:
+        if not files:
+            return False
+        fragment_index = self._build_fragment_index(extract_dir)
+        modified = False
+        for rel_path in files:
+            full_path = os.path.join(extract_dir, rel_path)
+            if not os.path.exists(full_path):
+                continue
+            try:
+                with open(full_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+            except UnicodeDecodeError:
+                continue
+            base_dir = os.path.dirname(rel_path)
+
+            def replace(match):
+                prefix, src_value, suffix = match.groups()
+                if "#" not in src_value:
+                    return match.group(0)
+                file_part, fragment = src_value.split("#", 1)
+                target = os.path.normpath(os.path.join(base_dir, file_part)).replace("\\", "/")
+                ids = fragment_index.get(target, set())
+                if not fragment or fragment not in ids:
+                    return f'{prefix}{file_part}{suffix}'
+                return match.group(0)
+
+            updated = re.sub(r'(<content\s+src=")([^"]*)(")', replace, content, flags=re.IGNORECASE)
+            if updated != content:
+                with open(full_path, "w", encoding="utf-8") as f:
+                    f.write(updated)
+                modified = True
+        return modified
+
+    def _build_fragment_index(self, extract_dir: str) -> dict:
+        index: dict[str, set[str]] = {}
+        for root, _, files in os.walk(extract_dir):
+            for file in files:
+                if not file.lower().endswith((".xhtml", ".html")):
+                    continue
+                full_path = os.path.join(root, file)
+                rel_path = os.path.relpath(full_path, extract_dir).replace("\\", "/")
+                try:
+                    with open(full_path, "r", encoding="utf-8") as f:
+                        content = f.read()
+                except UnicodeDecodeError:
+                    continue
+                index[rel_path] = set(re.findall(r'id="([^"]+)"', content))
+        return index
+
     def _iter_html_files(self, extract_dir: str):
         """Yield all HTML/XHTML file paths within the extracted EPUB."""
         for root, _, files in os.walk(extract_dir):
             for file in files:
                 if file.lower().endswith((".xhtml", ".html")):
                     yield os.path.join(root, file)
+
+    def _normalize_error_path(self, file_path: str | None) -> str:
+        if not file_path:
+            return ""
+        cleaned = file_path
+        if ".epub/" in cleaned:
+            cleaned = cleaned.split(".epub/", 1)[1]
+        return cleaned.replace("\\", "/")

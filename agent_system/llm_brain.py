@@ -165,14 +165,32 @@ class LLMBrain:
         
         # If still no match, return the content as-is and let json.loads fail
         return content
+    
+    def _truncate_for_llm(self, text: str, limit: int = 60000) -> str:
+        """Truncate long strings to keep LLM prompts under token limits."""
+        if len(text) <= limit:
+            return text
+        half = limit // 2
+        truncated = (
+            text[:half].rstrip()
+            + f"\n\n... [TRUNCATED {len(text) - limit} CHARS] ...\n\n"
+            + text[-half:].lstrip()
+        )
+        self.logger.info(
+            "Truncated epubcheck output from %s to %s characters for LLM prompt",
+            len(text),
+            limit,
+        )
+        return truncated
         
     def analyze_epub_errors(self, epubcheck_output: str) -> Dict[str, Any]:
         """Analyze epubcheck output and determine fixing strategy"""
+        excerpt = self._truncate_for_llm(epubcheck_output, 60000)
         
         prompt = f"""You are an expert EPUB validation analyst. Analyze this epubcheck output and provide a structured response.
 
 EPUBCHECK OUTPUT:
-{epubcheck_output}
+{excerpt}
 
 Provide a JSON response with:
 1. error_count: total number of errors
