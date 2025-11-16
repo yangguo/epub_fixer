@@ -7,6 +7,17 @@ import re
 import subprocess
 import json
 import tempfile
+import sys
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+try:
+    from epub_master_fixer import (
+        wrap_blockquote_text as master_wrap_blockquote_text,
+        ensure_image_alt_attributes as master_ensure_image_alt_attributes,
+    )
+except ImportError:
+    master_wrap_blockquote_text = None
+    master_ensure_image_alt_attributes = None
 
 class CustomFixAgent(BaseAgent):
     """Agent that uses LLM to generate custom fixes for persistent errors"""
@@ -31,6 +42,7 @@ class CustomFixAgent(BaseAgent):
         
         # 2. Extract detailed error information
         error_details = self.llm_brain.extract_error_details(validation_output, max_errors=20)
+        issue_flags = self._detect_issue_flags(error_details)
         
         if not error_details:
             self.result["success"] = True
@@ -48,64 +60,46 @@ class CustomFixAgent(BaseAgent):
             extract_dir = os.path.join(temp_dir, "epub")
             self._extract_epub(str(self.input_path), extract_dir)
             
-            # Process each error
+            # Apply deterministic fixes for known structural issues
             error_processed = False
+            if issue_flags["missing_body"]:
+                self.log("info", "Applying rule-based fix for missing </body> tags...")
+                if self._fix_missing_body_tags(extract_dir):
+                    fixed_count += 1
+                    error_processed = True
+
+            if issue_flags["blockquote"]:
+                self.log("info", "Wrapping bare blockquote text inside <p> tags...")
+                if self._fix_blockquote_issues(extract_dir):
+                    fixed_count += 1
+                    error_processed = True
+
+            if issue_flags["missing_alt"]:
+                self.log("info", "Adding fallback alt text to <img> tags...")
+                if self._fix_missing_alt_attributes(extract_dir):
+                    fixed_count += 1
+                    error_processed = True
+
+            # Process remaining errors via LLM-generated instructions
             for error in error_details:
+                if issue_flags["missing_body"] and self._is_body_error(error):
+                    continue
+                if issue_flags["blockquote"] and self._is_blockquote_error(error):
+                    continue
+                if issue_flags["missing_alt"] and self._is_missing_alt_error(error):
+                    continue
+
                 if error.get("severity") == "ERROR":
-                    # Check if this is a missing body tag error
-                    message = error.get("message", "").lower()
-                    if "body" in message and ("unclosed" in message or "missing" in message or "not closed" in message):
-                        # Fallback: Apply rule-based fix for missing body tags
-                        self.log("info", "Applying rule-based fix for missing </body> tags...")
-                        
-                        # Find all HTML/XHTML files
-                        for root, _, files in os.walk(extract_dir):
-                            for file in files:
-                                if file.endswith((".xhtml", ".html")):
-                                    file_path = os.path.join(root, file)
-                                    with open(file_path, "r", encoding="utf-8") as f:
-                                        content = f.read()
-                                    
-                                    # Fix missing </body> tag
-                                    if "<body" in content and "</body>" not in content:
-                                        # Add </body> before </html>
-                                        content = content.replace("</html>", "</body>\n</html>")
-                                        
-                                        with open(file_path, "w", encoding="utf-8") as f:
-                                            f.write(content)
-                                        
-                                        fixed_count += 1
-                                        error_processed = True
-                        
-                        break  # Already fixed all body tag errors
-                    else:
-                        # Generate fix instructions for other errors
-                        fix_instructions = self._generate_fix_instructions(error, extract_dir)
-                        
-                        # Apply the fix
-                        if self._apply_fix(fix_instructions, extract_dir, error):
-                            fixed_count += 1
-                            error_processed = True
+                    fix_instructions = self._generate_fix_instructions(error, extract_dir)
+                    if self._apply_fix(fix_instructions, extract_dir, error):
+                        fixed_count += 1
+                        error_processed = True
             
             # If no error details, try to find HTML files and fix body tags
-            if not error_details or not error_processed:
+            if not error_details and not error_processed:
                 self.log("info", "No error details available - trying to find and fix HTML files...")
-                for root, _, files in os.walk(extract_dir):
-                    for file in files:
-                        if file.endswith((".xhtml", ".html")):
-                            file_path = os.path.join(root, file)
-                            with open(file_path, "r", encoding="utf-8") as f:
-                                content = f.read()
-                            
-                            # Fix missing </body> tag
-                            if "<body" in content and "</body>" not in content:
-                                # Add </body> before </html>
-                                content = content.replace("</html>", "</body>\n</html>")
-                                
-                                with open(file_path, "w", encoding="utf-8") as f:
-                                    f.write(content)
-                                
-                                fixed_count += 1
+                if self._fix_missing_body_tags(extract_dir):
+                    fixed_count += 1
             
             # Repack the EPUB with fixes
             repacked_path = str(self.input_path) + "_temp.epub"
@@ -208,9 +202,12 @@ Return ONLY valid JSON, no markdown.
                 messages=[{"role": "user", "content": prompt}]
             )
             
-            content = response.content[0].text.strip()
-            if content.startswith("```"):
-                content = content.split("\n", 1)[1].rsplit("\n", 1)[0].strip()
+            content = self.llm_brain.get_response_text(response)
+            if not content:
+                raise ValueError("Empty fix instruction content from LLM")
+            
+            # Extract JSON from response
+            content = self.llm_brain._extract_json(content)
             
             return json.loads(content)
         except Exception as e:
@@ -271,3 +268,86 @@ Return ONLY valid JSON, no markdown.
         
         shutil.copy2(new_path, original_path)
         os.remove(new_path)
+
+    def _detect_issue_flags(self, error_details: list) -> dict:
+        """Detect common issue categories that we can fix deterministically."""
+        flags = {"missing_body": False, "blockquote": False, "missing_alt": False}
+        for error in error_details or []:
+            if self._is_body_error(error):
+                flags["missing_body"] = True
+            if self._is_blockquote_error(error):
+                flags["blockquote"] = True
+            if self._is_missing_alt_error(error):
+                flags["missing_alt"] = True
+        return flags
+
+    def _is_body_error(self, error: dict) -> bool:
+        message = (error.get("message") or "").lower()
+        return "body" in message and any(
+            keyword in message for keyword in ("unclosed", "not closed", "missing", "terminated")
+        )
+
+    def _is_blockquote_error(self, error: dict) -> bool:
+        message = (error.get("message") or "").lower()
+        return "blockquote" in message
+
+    def _is_missing_alt_error(self, error: dict) -> bool:
+        message = (error.get("message") or "").lower()
+        return "alt attribute" in message or "alt text" in message
+
+    def _fix_missing_body_tags(self, extract_dir: str) -> bool:
+        """Add </body> tags when they're missing."""
+        modified = False
+        for file_path in self._iter_html_files(extract_dir):
+            with open(file_path, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            if "<body" in content and "</body>" not in content:
+                content = content.replace("</html>", "</body>\n</html>")
+                with open(file_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+                modified = True
+        return modified
+
+    def _fix_blockquote_issues(self, extract_dir: str) -> bool:
+        """Wrap bare blockquote text in <p> tags."""
+        if master_wrap_blockquote_text is None:
+            self.log("warning", "wrap_blockquote_text helper not available")
+            return False
+
+        modified = False
+        for file_path in self._iter_html_files(extract_dir):
+            with open(file_path, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            updated = master_wrap_blockquote_text(content)
+            if updated != content:
+                with open(file_path, "w", encoding="utf-8") as f:
+                    f.write(updated)
+                modified = True
+        return modified
+
+    def _fix_missing_alt_attributes(self, extract_dir: str) -> bool:
+        """Ensure <img> tags have alt text."""
+        if master_ensure_image_alt_attributes is None:
+            self.log("warning", "ensure_image_alt_attributes helper not available")
+            return False
+
+        modified = False
+        for file_path in self._iter_html_files(extract_dir):
+            with open(file_path, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            updated = master_ensure_image_alt_attributes(content)
+            if updated != content:
+                with open(file_path, "w", encoding="utf-8") as f:
+                    f.write(updated)
+                modified = True
+        return modified
+
+    def _iter_html_files(self, extract_dir: str):
+        """Yield all HTML/XHTML file paths within the extracted EPUB."""
+        for root, _, files in os.walk(extract_dir):
+            for file in files:
+                if file.lower().endswith((".xhtml", ".html")):
+                    yield os.path.join(root, file)

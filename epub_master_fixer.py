@@ -72,42 +72,36 @@ def fix_dir_attributes(content):
     return content
 
 def fix_unclosed_p_tags(content):
-    """Fix unclosed p tags that cause fatal parsing errors"""
-    # PREPROCESSING: Fix mangled tags first
-    # 1. Fix tags like </p>s="author1"> which is invalid
+    """Fix unclosed/mismatched <p> tags without introducing new errors."""
     content = re.sub(r'</p>\s*s="([^"]*)">', r'<p class="\1">', content)
-    
-    # Now proceed with aggressive p tag fixing
-    # Count the number of opening and closing p tags
-    open_tags = len(re.findall(r'<p[^>]*(?<!/)>', content, flags=re.IGNORECASE))
-    close_tags = len(re.findall(r'</p>', content, flags=re.IGNORECASE))
-    
-    # If there are more open tags than closing tags, add closing tags
-    if open_tags > close_tags:
-        # Add closing tags at the end of the body
-        num_to_add = open_tags - close_tags
-        content = re.sub(r'</body>', '</p>' * num_to_add + '</body>', content, flags=re.IGNORECASE)
-    elif close_tags > open_tags:
-        # Remove extra closing tags
-        p_tags = list(re.finditer(r'</p>', content, flags=re.IGNORECASE))
-        extra_tags = close_tags - open_tags
-        for tag in p_tags[-extra_tags:]:
-            content = content[:tag.start()] + content[tag.end():]
-    
-    # Additional heuristic: Close all p tags before any block-level tag
-    block_elements = ['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'div', 'ul', 'ol', 'li', \
-                     'blockquote', 'table', 'tr', 'td', 'th', 'pre', 'hr', 'br',\
-                     'form', 'input', 'select', 'textarea', 'button', 'img']
-    
-    for elem in block_elements:
-        # Close p tag before opening a new block element
-        content = re.sub(
-            r'(?<!</p>)\s*(<p[^>]*>.*?)\s*<'+elem, 
-            r'\1</p><'+elem, 
-            content, 
-            flags=re.DOTALL | re.IGNORECASE
-        )
-    
+
+    pattern = re.compile(r'<p(?=[\s>])[^>]*>|</p>', re.IGNORECASE)
+    balanced_segments = []
+    last_index = 0
+    open_count = 0
+
+    for match in pattern.finditer(content):
+        balanced_segments.append(content[last_index:match.start()])
+        tag = match.group(0)
+        lower = tag.lower()
+        if lower.startswith('</p'):
+            if open_count > 0:
+                open_count -= 1
+                balanced_segments.append(tag)
+            else:
+                # Skip unmatched closing tags
+                pass
+        else:
+            open_count += 1
+            balanced_segments.append(tag)
+        last_index = match.end()
+
+    balanced_segments.append(content[last_index:])
+    content = ''.join(balanced_segments)
+
+    if open_count > 0:
+        content = re.sub(r'</body>', '</p>' * open_count + '</body>', content, flags=re.IGNORECASE)
+
     return content
 
 def fix_mangled_p_tags(content):
@@ -235,6 +229,10 @@ def fix_html_content(content):
             # Find the first opening body tag and insert closing tag at the end
             content = content.rstrip() + r'</body>'
     
+    # Structural fixes that require valid block-level containers
+    content = wrap_blockquote_text(content)
+    content = ensure_image_alt_attributes(content)
+
     return content
 
 def fix_structural_issues(content):
@@ -325,6 +323,51 @@ def fix_unclosed_anchor_tags(content):
         content = re.sub(pattern, replacement, content)
     
     return content
+
+def wrap_blockquote_text(content):
+    """Wrap direct blockquote text in <p> tags to satisfy EPUB 2 content model."""
+    block_level_pattern = re.compile(
+        r'^\s*<(?:address|blockquote|del|div|dl|h[1-6]|hr|ins|noscript|ol|p|pre|script|table|ul)\b',
+        re.IGNORECASE
+    )
+    pattern = re.compile(r'(<blockquote[^>]*>)(.*?)(</blockquote>)', re.DOTALL | re.IGNORECASE)
+
+    def wrap_inner(match):
+        open_tag, inner, close_tag = match.groups()
+        stripped = inner.strip()
+        if not stripped:
+            return f"{open_tag}<p>&nbsp;</p>{close_tag}"
+        if block_level_pattern.match(stripped):
+            return match.group(0)
+        # Wrap entire inner fragment in a paragraph while preserving spacing
+        wrapped = f"\n    <p>{stripped}</p>\n"
+        return f"{open_tag}{wrapped}{close_tag}"
+
+    return pattern.sub(wrap_inner, content)
+
+def ensure_image_alt_attributes(content):
+    """Ensure every <img> tag includes an alt attribute for accessibility."""
+    img_pattern = re.compile(r'<img\b[^>]*>', re.IGNORECASE)
+
+    def add_alt(match):
+        tag = match.group(0)
+        if re.search(r'\balt\s*=', tag, re.IGNORECASE):
+            return tag
+        src_match = re.search(r'\bsrc\s*=\s*"([^"]*)"', tag, re.IGNORECASE)
+        alt_value = "Image"
+        if src_match:
+            filename = os.path.basename(src_match.group(1))
+            alt_value = os.path.splitext(filename)[0].replace('_', ' ').replace('-', ' ').strip() or "Image"
+        closing_match = re.search(r'\s*/?>\s*$', tag)
+        if not closing_match:
+            return tag
+        prefix = tag[:closing_match.start()].rstrip()
+        closing = closing_match.group(0)
+        if not prefix.endswith(' '):
+            prefix += ' '
+        return f'{prefix}alt="{alt_value}"{closing}'
+
+    return img_pattern.sub(add_alt, content)
 
 def fix_fragment_identifiers(content, file_path):
     """Fix broken internal links and fragments by removing undefined fragment references"""

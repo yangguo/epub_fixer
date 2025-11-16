@@ -3,6 +3,7 @@
 import os
 import json
 import logging
+import re
 from typing import List, Dict, Any, Optional
 
 try:
@@ -46,6 +47,124 @@ class LLMBrain:
         self.logger = logging.getLogger("llm_brain")
         self.logger.info(f"LLM Brain initialized with model: {self.model}")
         self.conversation_history = []
+
+    def get_response_text(self, response: Any) -> str:
+        """Safely extract textual content from Anthropic responses."""
+
+        blocks = getattr(response, "content", None)
+        if blocks is None:
+            return ""
+
+        if isinstance(blocks, str):
+            return blocks.strip()
+
+        if not isinstance(blocks, (list, tuple)):
+            blocks = [blocks]
+
+        text_blocks = []
+        thinking_blocks = []
+
+        for block in blocks:
+            block_text = getattr(block, "text", None)
+            if block_text is None and isinstance(block, dict):
+                block_text = block.get("text")
+
+            if block_text:
+                text_blocks.append(block_text)
+                continue
+
+            thinking_text = getattr(block, "thinking", None)
+            if thinking_text is None and isinstance(block, dict):
+                thinking_text = block.get("thinking")
+
+            if thinking_text:
+                thinking_blocks.append(thinking_text)
+
+        cleaned_text = "\n".join(part.strip() for part in text_blocks if part and part.strip()).strip()
+        if cleaned_text:
+            return cleaned_text
+
+        cleaned_thinking = "\n".join(part.strip() for part in thinking_blocks if part and part.strip()).strip()
+        if cleaned_thinking:
+            return cleaned_thinking
+
+        if blocks:
+            fallback = blocks[0]
+            for attr in ("text", "thinking"):
+                value = getattr(fallback, attr, None)
+                if value:
+                    return str(value).strip()
+            if isinstance(fallback, dict):
+                for key in ("text", "thinking"):
+                    if fallback.get(key):
+                        return str(fallback[key]).strip()
+            return str(fallback).strip()
+
+        return ""
+    
+    def _extract_json(self, content: str) -> str:
+        """Extract JSON from potentially messy LLM response"""
+        content = content.strip()
+        
+        # Remove markdown code blocks
+        if content.startswith("```"):
+            lines = content.split("\n")
+            # Remove first line (```json or ```)
+            lines = lines[1:]
+            # Remove last line (```)
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            content = "\n".join(lines).strip()
+        
+        # Find which comes first: [ or {
+        bracket_idx = content.find('[')
+        brace_idx = content.find('{')
+        
+        # If both exist, use whichever comes first
+        if bracket_idx != -1 and brace_idx != -1:
+            if bracket_idx < brace_idx:
+                # Array comes first - extract it
+                bracket_count = 0
+                for i in range(bracket_idx, len(content)):
+                    if content[i] == '[':
+                        bracket_count += 1
+                    elif content[i] == ']':
+                        bracket_count -= 1
+                        if bracket_count == 0:
+                            return content[bracket_idx:i+1]
+            else:
+                # Object comes first - extract it
+                brace_count = 0
+                for i in range(brace_idx, len(content)):
+                    if content[i] == '{':
+                        brace_count += 1
+                    elif content[i] == '}':
+                        brace_count -= 1
+                        if brace_count == 0:
+                            return content[brace_idx:i+1]
+        elif brace_idx != -1:
+            # Only object exists
+            brace_count = 0
+            for i in range(brace_idx, len(content)):
+                if content[i] == '{':
+                    brace_count += 1
+                elif content[i] == '}':
+                    brace_count -= 1
+                    if brace_count == 0:
+                        return content[brace_idx:i+1]
+        elif bracket_idx != -1:
+            # Only array exists
+            bracket_count = 0
+            for i in range(bracket_idx, len(content)):
+                if content[i] == '[':
+                    bracket_count += 1
+                elif content[i] == ']':
+                    bracket_count -= 1
+                    if bracket_count == 0:
+                        return content[bracket_idx:i+1]
+        
+        # If still no match, return the content as-is and let json.loads fail
+        return content
         
     def analyze_epub_errors(self, epubcheck_output: str) -> Dict[str, Any]:
         """Analyze epubcheck output and determine fixing strategy"""
@@ -74,32 +193,21 @@ Return ONLY valid JSON, no markdown formatting."""
                 messages=[{"role": "user", "content": prompt}]
             )
             
-            content = response.content[0].text
+            content = self.get_response_text(response)
+            if not content:
+                raise ValueError("Empty response content from LLM")
             self.logger.debug(f"Raw LLM response: {content[:200]}...")
             
-            # Remove markdown code blocks if present
-            content = content.strip()
-            if content.startswith("```"):
-                lines = content.split("\n")
-                # Remove first line (```json or ```)
-                lines = lines[1:]
-                # Remove last line (```)
-                if lines and lines[-1].strip() == "```":
-                    lines = lines[:-1]
-                content = "\n".join(lines).strip()
+            # Clean up the response to extract JSON
+            content = self._extract_json(content)
             
-            # Try to parse JSON
+            # Parse the JSON
             try:
                 analysis = json.loads(content)
             except json.JSONDecodeError as je:
-                # If JSON parsing fails, try to extract JSON from text
-                self.logger.warning(f"JSON parse failed, attempting extraction: {je}")
-                import re
-                json_match = re.search(r'\{.*\}', content, re.DOTALL)
-                if json_match:
-                    analysis = json.loads(json_match.group(0))
-                else:
-                    raise
+                self.logger.error(f"JSON parse failed even after extraction: {je}")
+                self.logger.debug(f"Cleaned content: {content[:500]}...")
+                raise
             
             self.logger.info(f"LLM Analysis: {analysis.get('summary', 'N/A')}")
             return analysis
@@ -164,11 +272,12 @@ Return ONLY a JSON array like: ["validation", "fixing", "validation"]"""
                 messages=[{"role": "user", "content": prompt}]
             )
             
-            content = response.content[0].text.strip()
-            if content.startswith("```"):
-                content = content.split("\n", 1)[1].rsplit("\n", 1)[0]
-                if content.startswith("json"):
-                    content = content[4:].strip()
+            content = self.get_response_text(response)
+            if not content:
+                raise ValueError("Empty workflow response content from LLM")
+            
+            # Extract JSON from response
+            content = self._extract_json(content)
             
             workflow = json.loads(content)
             self.logger.info(f"LLM Workflow: {' -> '.join(workflow)}")
@@ -206,11 +315,12 @@ Return ONLY valid JSON."""
                 messages=[{"role": "user", "content": prompt}]
             )
             
-            content = response.content[0].text.strip()
-            if content.startswith("```"):
-                content = content.split("\n", 1)[1].rsplit("\n", 1)[0]
-                if content.startswith("json"):
-                    content = content[4:].strip()
+            content = self.get_response_text(response)
+            if not content:
+                raise ValueError("Empty fix strategy response content from LLM")
+            
+            # Extract JSON from response
+            content = self._extract_json(content)
             
             strategy = json.loads(content)
             return strategy
@@ -245,7 +355,7 @@ Return ONLY valid JSON."""
                 messages=messages
             )
             
-            answer = response.content[0].text
+            answer = self.get_response_text(response)
             return answer
             
         except Exception as e:
@@ -279,15 +389,75 @@ Return ONLY valid JSON array."""
                 messages=[{"role": "user", "content": prompt}]
             )
             
-            content = response.content[0].text.strip()
-            if content.startswith("```"):
-                content = content.split("\n", 1)[1].rsplit("\n", 1)[0]
-                if content.startswith("json"):
-                    content = content[4:].strip()
+            content = self.get_response_text(response)
+            if not content:
+                raise ValueError("Empty error extraction response content from LLM")
+            
+            # Extract JSON from response
+            content = self._extract_json(content)
             
             errors = json.loads(content)
-            return errors
+            if isinstance(errors, dict):
+                errors = [errors]
+            return errors[:max_errors]
             
         except Exception as e:
             self.logger.error(f"Error extraction failed: {e}")
-            return []
+            fallback = self._parse_epubcheck_errors(epubcheck_output, max_errors)
+            if fallback:
+                self.logger.info("Falling back to regex-based epubcheck error parser")
+            return fallback
+
+    def _parse_epubcheck_errors(self, epubcheck_output: str, max_errors: int) -> List[Dict[str, Any]]:
+        """Fallback parser for epubcheck output when LLM JSON extraction fails."""
+        pattern = re.compile(r'^(ERROR|FATAL|WARNING)\(([^)]+)\):\s+([^\n\r]+)$', re.MULTILINE)
+        errors: List[Dict[str, Any]] = []
+
+        for match in pattern.finditer(epubcheck_output):
+            severity_token, code, remainder = match.groups()
+            severity = "WARNING" if severity_token == "WARNING" else "ERROR"
+
+            file_path = remainder
+            message = ""
+            if "):" in remainder:
+                location_part, message = remainder.split("):", 1)
+                location_part += ")"
+            else:
+                location_part = remainder
+
+            line = column = None
+            line_match = re.search(r'\((\d+),\s*(\d+)\)', location_part)
+            if line_match:
+                line = int(line_match.group(1))
+                column = int(line_match.group(2))
+                file_path = location_part[:line_match.start()].rstrip()
+
+            file_path = file_path.rstrip(" :")
+            message = message.strip()
+
+            errors.append({
+                "type": code,
+                "severity": severity,
+                "file": file_path,
+                "line": line,
+                "column": column,
+                "message": message,
+                "suggestion": self._suggest_fix_hint(code, message.lower())
+            })
+
+            if len(errors) >= max_errors:
+                break
+
+        return errors
+
+    def _suggest_fix_hint(self, code: str, message_lower: str) -> str:
+        """Provide lightweight suggestions based on common epubcheck error codes."""
+        if "body" in message_lower and ("unclosed" in message_lower or "terminated" in message_lower):
+            return "Ensure each <body> tag has a closing </body> before </html>."
+        if "blockquote" in message_lower:
+            return "Wrap blockquote text inside <p> tags and close the </blockquote> element."
+        if "alt attribute" in message_lower or "alt text" in message_lower:
+            return "Provide descriptive alt text for every <img> tag."
+        if code == "RSC-005" and "text not allowed here" in message_lower:
+            return "Place inline text inside allowed block-level containers."
+        return "Review the referenced file and fix the structural HTML issue."
