@@ -112,6 +112,13 @@ class CustomFixAgent(BaseAgent):
                     fixed_count += 1
                     error_processed = True
 
+            meta_files = issue_files.get("meta_value", set())
+            if issue_flags.get("meta_value") or self._has_meta_value_errors(validation_output):
+                self.log("info", "Fixing invalid meta value attributes...")
+                if self._fix_meta_value_attributes(extract_dir, meta_files):
+                    fixed_count += 1
+                    error_processed = True
+
             # Process remaining errors via LLM-generated instructions
             for error in error_details:
                 if issue_flags["missing_body"] and self._is_body_error(error):
@@ -143,6 +150,17 @@ class CustomFixAgent(BaseAgent):
         # 4. Verify fixes with validation
         validation_output_after = self._run_epubcheck()
         error_count_after = validation_output_after.count('ERROR(') + validation_output_after.count('FATAL(')
+        if self._has_meta_value_errors(validation_output_after):
+            with tempfile.TemporaryDirectory() as temp_dir2:
+                extract_dir2 = os.path.join(temp_dir2, "epub")
+                self._extract_epub(str(self.input_path), extract_dir2)
+                if self._fix_meta_value_attributes(extract_dir2, set()):
+                    fixed_count += 1
+                    repacked_path2 = str(self.input_path) + "_temp2.epub"
+                    self._repack_epub(extract_dir2, repacked_path2)
+                    self._safe_replace(self.input_path, repacked_path2)
+                    validation_output_after = self._run_epubcheck()
+                    error_count_after = validation_output_after.count('ERROR(') + validation_output_after.count('FATAL(')
         
         self.result["success"] = True
         self.result["output"] = str(self.input_path)
@@ -307,12 +325,14 @@ Return ONLY valid JSON, no markdown.
             "missing_body": False,
             "blockquote": False,
             "missing_alt": False,
+            "meta_value": False,
         }
         file_map = {
             "unclosed_anchor": set(),
             "unclosed_p": set(),
             "cover_attr": set(),
             "missing_fragment": set(),
+            "meta_value": set(),
         }
         for error in error_details or []:
             file_path = self._normalize_error_path(error.get("file"))
@@ -322,6 +342,10 @@ Return ONLY valid JSON, no markdown.
                 flags["blockquote"] = True
             if self._is_missing_alt_error(error):
                 flags["missing_alt"] = True
+            if self._is_meta_value_error(error):
+                flags["meta_value"] = True
+                if file_path:
+                    file_map["meta_value"].add(file_path)
             if self._is_unclosed_anchor_error(error) and file_path:
                 file_map["unclosed_anchor"].add(file_path)
             if self._is_unclosed_p_error(error) and file_path:
@@ -362,6 +386,15 @@ Return ONLY valid JSON, no markdown.
     def _is_missing_fragment_error(self, error: dict) -> bool:
         message = (error.get("message") or "").lower()
         return "fragment identifier is not defined" in message
+
+    def _is_meta_value_error(self, error: dict) -> bool:
+        message = (error.get("message") or "").lower()
+        code = (error.get("type") or "").upper()
+        return ("attribute \"value\"" in message or " attribute 'value'" in message) or (code == "RSC-005" and "value" in message)
+
+    def _has_meta_value_errors(self, validation_output: str) -> bool:
+        text = (validation_output or "").lower()
+        return ("attribute \"value\"" in text) or ("rsc-005" in text and "value" in text)
 
     def _fix_missing_body_tags(self, extract_dir: str) -> bool:
         """Add </body> tags when they're missing."""
@@ -501,6 +534,44 @@ Return ONLY valid JSON, no markdown.
             updated = re.sub(r'(<content\s+src=")([^"]*)(")', replace, content, flags=re.IGNORECASE)
             if updated != content:
                 with open(full_path, "w", encoding="utf-8") as f:
+                    f.write(updated)
+                modified = True
+        return modified
+
+    def _fix_meta_value_attributes(self, extract_dir: str, files: set[str]) -> bool:
+        modified = False
+        targets = []
+        if files:
+            for rel_path in files:
+                full_path = os.path.join(extract_dir, rel_path)
+                if os.path.exists(full_path):
+                    targets.append(full_path)
+        else:
+            for root, _, fs in os.walk(extract_dir):
+                for file in fs:
+                    if file.lower().endswith((".xhtml", ".html", ".xml", ".opf")):
+                        targets.append(os.path.join(root, file))
+        for file_path in targets:
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+            except UnicodeDecodeError:
+                continue
+            def replace_tag(m):
+                tag = m.group(0)
+                if re.search(r"\bvalue\s*=\s*\"", tag, re.IGNORECASE):
+                    vm = re.search(r"\bvalue\s*=\s*\"([^\"]*)\"", tag, re.IGNORECASE)
+                    if vm:
+                        val = vm.group(1)
+                        if re.search(r"\bcontent\s*=", tag, re.IGNORECASE):
+                            new_tag = re.sub(r"\s*\bvalue\s*=\s*\"[^\"]*\"", "", tag, flags=re.IGNORECASE)
+                            return new_tag
+                        new_tag = re.sub(r"\bvalue\s*=\s*\"[^\"]*\"", f" content=\"{val}\"", tag, flags=re.IGNORECASE)
+                        return new_tag
+                return tag
+            updated = re.sub(r"<meta\b[^>]*>", replace_tag, content, flags=re.IGNORECASE)
+            if updated != content:
+                with open(file_path, "w", encoding="utf-8") as f:
                     f.write(updated)
                 modified = True
         return modified

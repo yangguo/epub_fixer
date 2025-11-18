@@ -144,6 +144,21 @@ def fix_html_content(content):
     # Fix malformed head tags first
     content = re.sub(r'</head[^>]*>', '</head>', content, flags=re.IGNORECASE)
     
+    def fix_meta_value_attributes(text):
+        def replace_tag(m):
+            tag = m.group(0)
+            if re.search(r'\bvalue\s*=\s*"', tag, re.IGNORECASE):
+                vm = re.search(r'\bvalue\s*=\s*"([^"]*)"', tag, re.IGNORECASE)
+                if vm:
+                    val = vm.group(1)
+                    if re.search(r'\bcontent\s*=', tag, re.IGNORECASE):
+                        return re.sub(r'\s*\bvalue\s*=\s*"[^"]*"', '', tag, flags=re.IGNORECASE)
+                    return re.sub(r'\bvalue\s*=\s*"[^"]*"', f' content="{val}"', tag, flags=re.IGNORECASE)
+            return tag
+        return re.sub(r'<meta\b[^>]*>', replace_tag, text, flags=re.IGNORECASE)
+    
+    content = fix_meta_value_attributes(content)
+    
     # Fix XML namespace issues - ensure proper XHTML namespace
     # More robust namespace handling
     # Find the html tag and ensure it has proper namespace
