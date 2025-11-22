@@ -19,7 +19,7 @@ import os
 import re
 import zipfile
 
-from utils import run_epubcheck, count_errors
+from .epub_utils import EPUBCHECK_JAR, run_epubcheck, count_errors
 import shutil
 import sys
 import tempfile
@@ -53,7 +53,7 @@ def build_fragment_index(extract_dir):
     fragment_index = {}
     for root, _, files in os.walk(extract_dir):
         for file in files:
-            if not file.lower().endswith(('.xhtml', '.html', '.htm', '.xml')):
+            if not file.lower().endswith(('.xhtml', '.html', '.xml')):
                 continue
             file_path = os.path.join(root, file)
             try:
@@ -514,7 +514,7 @@ def fix_fragment_identifiers(content, file_path):
             if len(parts) == 2:
                 file_part, fragment = parts
                 # If it's a local reference (same file or no file specified)
-                if not file_part or file_part.endswith(('.xhtml', '.html', '.htm')):
+                if not file_part or file_part.endswith(('.xhtml', '.html')):
                     # Check if fragment exists
                     if fragment and fragment not in existing_ids:
                         # Remove the fragment part
@@ -671,6 +671,26 @@ def fix_opf_file(content):
     
     return content
 
+def fix_css_file(content):
+    """Fix CSS file issues - remove invalid font references and malformed rules."""
+    # Remove @font-face rules with invalid or missing src URLs (like XXXXXXXXXXXXXXXX)
+    content = re.sub(
+        r'@font-face\s*\{[^}]*src:\s*url\([^)]*XXXX[^)]*\)[^}]*\}',
+        '',
+        content,
+        flags=re.IGNORECASE
+    )
+    
+    # Remove any other malformed url() references
+    content = re.sub(
+        r'src:\s*url\([^)]*XXXX[^)]*\);',
+        '',
+        content,
+        flags=re.IGNORECASE
+    )
+    
+    return content
+
 def fix_missing_file_references(content):
     """Remove references to files that don't exist in the EPUB"""
     # List of missing files based on the error output
@@ -708,26 +728,6 @@ def fix_missing_file_references(content):
     for pattern in missing_patterns:
         content = re.sub(pattern, '', content, flags=re.IGNORECASE)
 
-    return content
-
-def fix_css_file(content):
-    """Fix CSS file issues - remove invalid font references and malformed rules."""
-    # Remove @font-face rules with invalid or missing src URLs (like XXXXXXXXXXXXXXXX)
-    content = re.sub(
-        r'@font-face\s*\{[^}]*src:\s*url\([^)]*XXXX[^)]*\)[^}]*\}',
-        '',
-        content,
-        flags=re.IGNORECASE
-    )
-    
-    # Remove any other malformed url() references
-    content = re.sub(
-        r'src:\s*url\([^)]*XXXX[^)]*\);',
-        '',
-        content,
-        flags=re.IGNORECASE
-    )
-    
     return content
 
 def process_file(file_path, opf_content=None, fragment_index=None, root_dir=None):
@@ -810,7 +810,7 @@ def fix_epub(epub_path):
         process_files = []
         for root, dirs, files in os.walk(extract_dir):
             for file in files:
-                if file.endswith(('.xhtml', '.html', '.htm', '.ncx', '.opf', '.xml', '.css')):
+                if file.endswith(('.xhtml', '.html', '.ncx', '.opf', '.xml', '.css')):
                     process_files.append(os.path.join(root, file))
         
         fixed_count = 0
@@ -828,8 +828,8 @@ def fix_epub(epub_path):
 
 def validate_and_fix(epub_path, max_iterations=5):
     """Iterative validation and fixing"""
-    if not os.path.exists('epubcheck.jar'):
-        print("❌ epubcheck.jar not found")
+    if not os.path.exists(EPUBCHECK_JAR):
+        print(f"❌ epubcheck.jar not found at {EPUBCHECK_JAR}")
         return False
 
     for iteration in range(1, max_iterations + 1):
@@ -855,7 +855,8 @@ def validate_and_fix(epub_path, max_iterations=5):
 def main():
     """Command line interface"""
     if len(sys.argv) != 2:
-        print("Usage: python epub_master_fixer.py <epub_file>")
+        script = os.path.basename(__file__)
+        print(f"Usage: python {script} <epub_file>")
         return
     
     epub_path = sys.argv[1]

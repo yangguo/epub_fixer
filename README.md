@@ -141,6 +141,19 @@ python epub_agent_cli.py mybook.epub --llm --max-attempts 5
 python epub_agent_cli.py mybook.epub --llm -v
 ```
 
+### OpenAI Agent SDK (Beta)
+```bash
+python -m openai_agent_sdk.cli mybook.epub \
+  --model gpt-4.1 \
+  --output mybook_fixed.epub
+```
+Uses the same rule-based fixer but routes decisions through the OpenAI Agents SDK (`openai-agents`
+package with `function_tool` wrappers). Reads OpenAI settings from environment variables
+(`OPENAI_API_KEY`, optional `OPENAI_BASE_URL`, `OPENAI_MODEL`, etc.). The CLI auto-validates after
+the run and will reuse the OpenAI agent for follow-up passes until errors clear or `--max-followups`
+is reached (`--no-continue` to disable). The OpenAI SDK package carries its own epubcheck runner
+and rule-based fixer—no imports from the repo root.
+
 ## 🔍 Understanding Output
 
 ### Validation Results

@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Custom Fix Agent - Uses LLM to generate and apply tailored fixes"""
 
-from .base_agent import BaseAgent
 import os
 import re
 import subprocess
 import json
 import tempfile
 import sys
+
+from .base_agent import BaseAgent
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 try:
@@ -46,6 +47,7 @@ class CustomFixAgent(BaseAgent):
         
         # 2. Extract detailed error information
         error_details = self.llm_brain.extract_error_details(validation_output, max_errors=20)
+        error_details = self._sanitize_error_details(error_details)
         issue_flags, issue_files = self._detect_issue_flags(error_details)
         
         if not error_details:
@@ -69,6 +71,16 @@ class CustomFixAgent(BaseAgent):
             if issue_flags["missing_body"]:
                 self.log("info", "Applying rule-based fix for missing </body> tags...")
                 if self._fix_missing_body_tags(extract_dir):
+                    fixed_count += 1
+                    error_processed = True
+            if issue_flags["invalid_id"]:
+                self.log("info", "Normalizing XML IDs that break name rules...")
+                if self._fix_invalid_ids(extract_dir, issue_files.get("invalid_id", set())):
+                    fixed_count += 1
+                    error_processed = True
+            if issue_flags["missing_resource"]:
+                self.log("info", "Cleaning references to missing resources...")
+                if self._fix_missing_resources(extract_dir, issue_files.get("missing_resource", {})):
                     fixed_count += 1
                     error_processed = True
 
@@ -319,6 +331,16 @@ Return ONLY valid JSON, no markdown.
         shutil.copy2(new_path, original_path)
         os.remove(new_path)
 
+    def _sanitize_error_details(self, error_details: list | None) -> list[dict]:
+        """Ensure error details are dictionaries before processing."""
+        sanitized: list[dict] = []
+        for idx, error in enumerate(error_details or []):
+            if not isinstance(error, dict):
+                self.log("warning", f"Skipping non-dict error detail at index {idx}: {error!r}")
+                continue
+            sanitized.append(error)
+        return sanitized
+
     def _detect_issue_flags(self, error_details: list) -> tuple[dict, dict]:
         """Detect common issue categories that we can fix deterministically."""
         flags = {
@@ -326,6 +348,8 @@ Return ONLY valid JSON, no markdown.
             "blockquote": False,
             "missing_alt": False,
             "meta_value": False,
+            "invalid_id": False,
+            "missing_resource": False,
         }
         file_map = {
             "unclosed_anchor": set(),
@@ -333,8 +357,13 @@ Return ONLY valid JSON, no markdown.
             "cover_attr": set(),
             "missing_fragment": set(),
             "meta_value": set(),
+            "invalid_id": set(),
+            "missing_resource": {},
         }
-        for error in error_details or []:
+        for idx, error in enumerate(error_details or []):
+            if not isinstance(error, dict):
+                self.log("warning", f"Skipping non-dict error detail at index {idx}: {error!r}")
+                continue
             file_path = self._normalize_error_path(error.get("file"))
             if self._is_body_error(error):
                 flags["missing_body"] = True
@@ -346,6 +375,9 @@ Return ONLY valid JSON, no markdown.
                 flags["meta_value"] = True
                 if file_path:
                     file_map["meta_value"].add(file_path)
+            if self._is_invalid_id_error(error) and file_path:
+                flags["invalid_id"] = True
+                file_map["invalid_id"].add(file_path)
             if self._is_unclosed_anchor_error(error) and file_path:
                 file_map["unclosed_anchor"].add(file_path)
             if self._is_unclosed_p_error(error) and file_path:
@@ -354,7 +386,19 @@ Return ONLY valid JSON, no markdown.
                 file_map["cover_attr"].add(file_path)
             if self._is_missing_fragment_error(error) and file_path:
                 file_map["missing_fragment"].add(file_path)
+            missing_resource = self._extract_missing_resource_path(error.get("message", ""))
+            if missing_resource and file_path:
+                flags["missing_resource"] = True
+                file_map["missing_resource"].setdefault(file_path, set()).add(missing_resource)
         return flags, file_map
+    
+    def _is_invalid_id_error(self, error: dict) -> bool:
+        message = (error.get("message") or "").lower()
+        return "attribute \"id\" is invalid" in message or "xml name without colons" in message
+    
+    def _extract_missing_resource_path(self, message: str) -> str:
+        match = re.search(r'resource\s+"([^"]+)"', message or "", flags=re.IGNORECASE)
+        return match.group(1) if match else ""
 
     def _is_body_error(self, error: dict) -> bool:
         message = (error.get("message") or "").lower()
@@ -391,6 +435,27 @@ Return ONLY valid JSON, no markdown.
         message = (error.get("message") or "").lower()
         code = (error.get("type") or "").upper()
         return ("attribute \"value\"" in message or " attribute 'value'" in message) or (code == "RSC-005" and "value" in message)
+    
+    def _needs_id_normalization(self, value: str) -> bool:
+        if not value:
+            return True
+        return not re.match(r"^[A-Za-z_][A-Za-z0-9._-]*$", value)
+    
+    def _normalize_id_value(self, value: str, taken_ids: set[str]) -> str:
+        candidate = value.replace(":", "_")
+        candidate = re.sub(r"[^A-Za-z0-9._-]", "_", candidate)
+        candidate = re.sub(r"_+", "_", candidate).strip("_")
+        if not candidate:
+            candidate = "id_auto"
+        if not re.match(r"^[A-Za-z_]", candidate):
+            candidate = f"id_{candidate}"
+        base = candidate
+        suffix = 1
+        while candidate in taken_ids:
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+        taken_ids.add(candidate)
+        return candidate
 
     def _has_meta_value_errors(self, validation_output: str) -> bool:
         text = (validation_output or "").lower()
@@ -575,6 +640,148 @@ Return ONLY valid JSON, no markdown.
                     f.write(updated)
                 modified = True
         return modified
+    
+    def _fix_invalid_ids(self, extract_dir: str, files: set[str]) -> bool:
+        """Normalize invalid XML IDs and update references."""
+        modified = False
+        targets = []
+        if files:
+            for rel_path in files:
+                full_path = os.path.join(extract_dir, rel_path)
+                if os.path.exists(full_path):
+                    targets.append(full_path)
+        else:
+            targets = list(self._iter_html_files(extract_dir))
+
+        id_map: dict[str, str] = {}
+
+        for file_path in targets:
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+            except UnicodeDecodeError:
+                continue
+
+            ids = re.findall(r'id="([^"]*)"', content)
+            if not ids:
+                continue
+
+            taken_ids = set(ids)
+            replacements: dict[str, str] = {}
+
+            for value in ids:
+                if not self._needs_id_normalization(value):
+                    continue
+                if value in id_map:
+                    new_value = id_map[value]
+                    replacements[value] = new_value
+                    taken_ids.add(new_value)
+                    continue
+                new_value = self._normalize_id_value(value, taken_ids)
+                replacements[value] = new_value
+                id_map[value] = new_value
+
+            if not replacements:
+                continue
+
+            def replace(match):
+                original = match.group(1)
+                if original in replacements:
+                    return f'id="{replacements[original]}"'
+                return match.group(0)
+
+            updated = re.sub(r'id="([^"]*)"', replace, content)
+            if updated != content:
+                with open(file_path, "w", encoding="utf-8") as f:
+                    f.write(updated)
+                modified = True
+
+        if id_map:
+            self._rewrite_fragment_references(extract_dir, id_map)
+
+        return modified
+
+    def _fix_missing_resources(self, extract_dir: str, file_map: dict) -> bool:
+        """Remove or neutralize references to resources that don't exist."""
+        modified = False
+        for rel_path, missing_targets in file_map.items():
+            full_path = os.path.join(extract_dir, rel_path)
+            if not os.path.exists(full_path):
+                continue
+            try:
+                with open(full_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+            except UnicodeDecodeError:
+                continue
+
+            targets = missing_targets or set()
+            if rel_path.lower().endswith((".css",)):
+                inferred_missing = self._find_missing_urls(full_path, content, extract_dir)
+                targets = targets or inferred_missing
+
+            updated = self._remove_missing_css_urls(content, targets)
+            if updated != content:
+                with open(full_path, "w", encoding="utf-8") as f:
+                    f.write(updated)
+                modified = True
+
+        return modified
+
+    def _find_missing_urls(self, css_path: str, content: str, extract_dir: str) -> set[str]:
+        """Discover url(...) references that point to files not present in the EPUB."""
+        base_dir = os.path.dirname(css_path)
+        missing: set[str] = set()
+        for match in re.finditer(r'url\(([^)]+)\)', content, flags=re.IGNORECASE):
+            raw = match.group(1).strip().strip("\"'")
+            if not raw or raw.startswith("data:"):
+                continue
+            normalized = os.path.normpath(os.path.join(base_dir, raw)).replace("\\", "/")
+            if not os.path.exists(normalized):
+                missing.add(raw)
+        return missing
+
+    def _remove_missing_css_urls(self, content: str, targets: set[str]) -> str:
+        """Strip @font-face blocks or rules that reference missing assets."""
+        updated = content
+        for target in targets:
+            escaped = re.escape(target)
+            block_pattern = re.compile(r'@font-face\s*{[^}]*' + escaped + r'[^}]*}', re.IGNORECASE | re.DOTALL)
+            after_block = block_pattern.sub("", updated)
+            if after_block != updated:
+                updated = after_block
+                continue
+            updated = re.sub(r'^.*' + escaped + r'.*;\s*', '', updated, flags=re.IGNORECASE | re.MULTILINE)
+            updated = updated.replace(f"url({target})", "")
+            updated = updated.replace(f"url('{target}')", "")
+            updated = updated.replace(f"url(\"{target}\")", "")
+        return updated
+
+    def _rewrite_fragment_references(self, extract_dir: str, id_map: dict[str, str]) -> None:
+        """Update href/src/idref fragments that point to renamed IDs."""
+        for file_path in self._iter_text_like_files(extract_dir):
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+            except UnicodeDecodeError:
+                continue
+
+            updated = content
+            for old, new in id_map.items():
+                if old == new:
+                    continue
+                updated = updated.replace(f"#{old}", f"#{new}")
+                updated = re.sub(rf'idref="\\s*{re.escape(old)}\\s*"', f'idref="{new}"', updated, flags=re.IGNORECASE)
+
+            if updated != content:
+                with open(file_path, "w", encoding="utf-8") as f:
+                    f.write(updated)
+
+    def _iter_text_like_files(self, extract_dir: str, suffixes: tuple[str, ...] = (".xhtml", ".html", ".opf", ".ncx", ".xml", ".css")):
+        """Yield text-based files for reference rewrites."""
+        for root, _, files in os.walk(extract_dir):
+            for file in files:
+                if file.lower().endswith(suffixes):
+                    yield os.path.join(root, file)
 
     def _build_fragment_index(self, extract_dir: str) -> dict:
         index: dict[str, set[str]] = {}
@@ -596,7 +803,7 @@ Return ONLY valid JSON, no markdown.
         """Yield all HTML/XHTML file paths within the extracted EPUB."""
         for root, _, files in os.walk(extract_dir):
             for file in files:
-                if file.lower().endswith((".xhtml", ".html")):
+                if file.lower().endswith((".xhtml", ".html", ".htm")):
                     yield os.path.join(root, file)
 
     def _normalize_error_path(self, file_path: str | None) -> str:
