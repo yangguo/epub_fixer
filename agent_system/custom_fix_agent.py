@@ -7,6 +7,7 @@ import subprocess
 import json
 import tempfile
 import sys
+from urllib.parse import urlsplit, urlunsplit
 
 from .base_agent import BaseAgent
 
@@ -81,6 +82,13 @@ class CustomFixAgent(BaseAgent):
             if issue_flags["missing_resource"]:
                 self.log("info", "Cleaning references to missing resources...")
                 if self._fix_missing_resources(extract_dir, issue_files.get("missing_resource", {})):
+                    fixed_count += 1
+                    error_processed = True
+
+            url_issues = issue_files.get("invalid_url_space", [])
+            if url_issues:
+                self.log("info", "Normalizing URLs that contain spaces...")
+                if self._fix_urls_with_spaces(extract_dir, url_issues):
                     fixed_count += 1
                     error_processed = True
 
@@ -350,6 +358,7 @@ Return ONLY valid JSON, no markdown.
             "meta_value": False,
             "invalid_id": False,
             "missing_resource": False,
+            "invalid_url_space": False,
         }
         file_map = {
             "unclosed_anchor": set(),
@@ -359,6 +368,7 @@ Return ONLY valid JSON, no markdown.
             "meta_value": set(),
             "invalid_id": set(),
             "missing_resource": {},
+            "invalid_url_space": [],
         }
         for idx, error in enumerate(error_details or []):
             if not isinstance(error, dict):
@@ -390,6 +400,11 @@ Return ONLY valid JSON, no markdown.
             if missing_resource and file_path:
                 flags["missing_resource"] = True
                 file_map["missing_resource"].setdefault(file_path, set()).add(missing_resource)
+            if self._is_invalid_url_space_error(error):
+                url = self._extract_url_from_message(error.get("message", ""))
+                if file_path and url:
+                    flags["invalid_url_space"] = True
+                    file_map["invalid_url_space"].append({"file": file_path, "url": url})
         return flags, file_map
     
     def _is_invalid_id_error(self, error: dict) -> bool:
@@ -398,6 +413,13 @@ Return ONLY valid JSON, no markdown.
     
     def _extract_missing_resource_path(self, message: str) -> str:
         match = re.search(r'resource\s+"([^"]+)"', message or "", flags=re.IGNORECASE)
+        return match.group(1) if match else ""
+
+    def _extract_url_from_message(self, message: str) -> str:
+        """Pull the offending URL from an epubcheck error message."""
+        if not message:
+            return ""
+        match = re.search(r'"([^"]+)"', message)
         return match.group(1) if match else ""
 
     def _is_body_error(self, error: dict) -> bool:
@@ -435,6 +457,12 @@ Return ONLY valid JSON, no markdown.
         message = (error.get("message") or "").lower()
         code = (error.get("type") or "").upper()
         return ("attribute \"value\"" in message or " attribute 'value'" in message) or (code == "RSC-005" and "value" in message)
+
+    def _is_invalid_url_space_error(self, error: dict) -> bool:
+        """Detect invalid URL errors caused by space characters."""
+        message = (error.get("message") or "").lower()
+        code = (error.get("type") or "").upper()
+        return code == "RSC-020" and "url" in message and "space" in message
     
     def _needs_id_normalization(self, value: str) -> bool:
         if not value:
@@ -700,6 +728,64 @@ Return ONLY valid JSON, no markdown.
             self._rewrite_fragment_references(extract_dir, id_map)
 
         return modified
+
+    def _fix_urls_with_spaces(self, extract_dir: str, url_issues: list[dict]) -> bool:
+        """Repair URLs flagged for containing space characters."""
+        grouped: dict[str, set[str]] = {}
+        for issue in url_issues:
+            rel_path = issue.get("file")
+            url = issue.get("url")
+            if not rel_path or not url:
+                continue
+            grouped.setdefault(rel_path, set()).add(url)
+
+        modified = False
+        for rel_path, urls in grouped.items():
+            full_path = os.path.join(extract_dir, rel_path)
+            if not os.path.exists(full_path):
+                continue
+            try:
+                with open(full_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+            except UnicodeDecodeError:
+                continue
+
+            updated = content
+            for original in urls:
+                repaired = self._repair_url_with_spaces(original)
+                if repaired != original and original in updated:
+                    updated = updated.replace(original, repaired)
+                    self.log("debug", f"Rewrote URL in {rel_path}: {original} -> {repaired}")
+
+            if updated != content:
+                with open(full_path, "w", encoding="utf-8") as f:
+                    f.write(updated)
+                modified = True
+
+        return modified
+
+    def _repair_url_with_spaces(self, url: str) -> str:
+        """Normalize a URL by stripping spaces in the host and encoding spaces elsewhere."""
+        if not url or " " not in url:
+            return url
+
+        try:
+            parsed = urlsplit(url)
+        except Exception:
+            return url.replace(" ", "%20")
+
+        netloc = parsed.netloc.replace(" ", "")
+        path = parsed.path.replace(" ", "%20")
+        query = parsed.query.replace(" ", "%20")
+        fragment = parsed.fragment.replace(" ", "%20")
+
+        rebuilt = urlunsplit((parsed.scheme, netloc, path, query, fragment))
+
+        # Fallback if urlsplit failed to capture a host (common with malformed inputs)
+        if (not parsed.netloc or rebuilt == url) and " " in url:
+            rebuilt = url.replace(" ", "%20")
+
+        return rebuilt
 
     def _fix_missing_resources(self, extract_dir: str, file_map: dict) -> bool:
         """Remove or neutralize references to resources that don't exist."""
