@@ -1,0 +1,15 @@
+{
+  "name": "vercel-node-agent",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "lint": "echo \"No lint configured\"",
+    "test": "node -c api/agent.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.32.0",
+    "jszip": "^3.10.1",
+    "openai": "^4.76.0"
+  }
+}

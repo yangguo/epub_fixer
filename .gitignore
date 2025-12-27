@@ -245,3 +245,15 @@ validation_results.txt
 *_backup.epub
 *_original.epub
 
+# Node.js (for vercel_node_agent)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+.vercel/
+.next/
+.turbo/
