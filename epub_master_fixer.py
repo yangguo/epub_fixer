@@ -73,23 +73,26 @@ def fix_invalid_id_attributes(content):
         prefix = match.group(1)
         id_value = match.group(2)
         suffix = match.group(3)
-        
+
         if not id_value:
             return match.group(0)
-        
+
         # Replace colons with underscores
         if ':' in id_value:
             id_value = id_value.replace(':', '_')
-        
+
         # If ID starts with a number, prefix with 'id_'
         if id_value and id_value[0].isdigit():
             id_value = f'id_{id_value}'
-        
+
         return f'{prefix}{id_value}{suffix}'
-    
+
     # Fix id attributes in all HTML tags (body, div, span, etc.)
     content = re.sub(r'(\bid\s*=\s*")([^"]*)(")', fix_id, content, flags=re.IGNORECASE)
-    
+
+    # Fix idref attributes to match renamed IDs (spine, guide, NCX references)
+    content = re.sub(r'(\bidref\s*=\s*")([^"]*)(")', fix_id, content, flags=re.IGNORECASE)
+
     return content
 
 def fix_dir_attributes(content):
@@ -207,6 +210,20 @@ def fix_html_content(content):
     content = fix_structural_issues(content)
     
     # EPUB 2.0.1 compatibility fixes
+    # Protect toc nav elements (required by EPUB 3 spec) from conversion to div.
+    # Replace the entire toc nav block with a placeholder token before fixes,
+    # then restore it after the EPUB2 compatibility pass.
+    toc_nav_blocks = []
+    def save_toc_nav(match):
+        toc_nav_blocks.append(match.group(0))
+        return f'%%TOC_NAV_BLOCK_{len(toc_nav_blocks) - 1}%%'
+    content = re.sub(
+        r'<nav\s+epub:type="toc".*?</nav>',
+        save_toc_nav,
+        content,
+        flags=re.DOTALL | re.IGNORECASE
+    )
+
     fixes = [
         # Remove EPUB 3 specific attributes from head tags  
         (r'<head[^>]*\s+epub:prefix="[^"]*"([^>]*)>', r'<head\1>'),
@@ -243,13 +260,24 @@ def fix_html_content(content):
     
     for pattern, replacement in fixes:
         content = re.sub(pattern, replacement, content, flags=re.IGNORECASE)
-    
+
+    # Restore protected toc nav blocks
+    for i, block in enumerate(toc_nav_blocks):
+        content = content.replace(f'%%TOC_NAV_BLOCK_{i}%%', block)
+
     # Fix malformed sup tags (e.g., <sup>1</a></sup> -> <sup>1</sup>)
     content = fix_malformed_sup_tags(content)
     
     # Additional cleanup for empty attributes
     content = re.sub(r'\s+\w+="\s*"', '', content)  # Remove empty attributes
     
+    # Fix hrefs that look like bare domain names missing a scheme (e.g., "notability.com/")
+    content = re.sub(
+        r'href="((?:[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+(?:com|org|net|edu|gov|io|co|uk|cn|jp|de|fr|ru|br|in|au|ca|it|es|nl|se|no|dk|fi|pt|pl|ie|nz|sg|hk|tw|kr|mx|ar|ch|at|be)/[^"]*)"',
+        r'href="https://\1"',
+        content
+    )
+
     # Remove references to missing CSS files
     content = re.sub(r'<link[^>]*href="[^"]*WileyTemplate_v5\.1\.css"[^>]*/?>', '', content, flags=re.IGNORECASE)
     
@@ -660,15 +688,29 @@ def fix_opf_file(content):
     """Fix OPF file issues - remove invalid attributes and ensure proper structure"""
     # Fix 1: Remove page-map attribute from spine element (not allowed in EPUB 2.0.1)
     content = re.sub(r'<spine([^>]*)\s+page-map="[^"]*"([^>]*)>', r'<spine\1\2>', content)
-    
-    # Fix 2: Ensure all referenced items are in spine
+
+    # Fix 2: Fix invalid XML IDs that start with numbers or contain colons
+    content = fix_invalid_id_attributes(content)
+
+    # Fix 3: Change non-standard "text/html" to "application/xhtml+xml" for EPUB 3
+    # (EPUB 3 requires application/xhtml+xml for XHTML content documents)
+    content = content.replace('media-type="text/html"', 'media-type="application/xhtml+xml"')
+
+    # Fix 4: Make non-linear cover items linear so they are reachable (fixes OPF-096)
+    content = re.sub(
+        r'(<itemref\s+idref="[^"]*cover[^"]*")\s+linear="no"',
+        r'\1',
+        content
+    )
+
+    # Fix 5: Ensure all referenced items are in spine
     manifest_items = re.findall(r'<item[^>]*id="([^"]*)"[^>]*href="([^"]*cover\.xhtml[^"]*)"', content, re.IGNORECASE)
     spine_items = re.findall(r'<itemref[^>]*idref="([^"]*)"', content)
-    
+
     for item_id, href in manifest_items:
         if item_id not in spine_items:
             content = re.sub(r'(</spine>)', f'    <itemref idref="{item_id}"/>\n\\1', content)
-    
+
     return content
 
 def fix_missing_file_references(content):

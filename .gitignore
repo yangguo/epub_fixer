@@ -234,6 +234,7 @@ demo_*.epub
 
 # IDE and editor settings
 .claude/
+.antigravitycli/
 .vscode/
 .idea/
 
