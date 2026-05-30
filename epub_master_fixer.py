@@ -19,7 +19,7 @@ import os
 import re
 import zipfile
 
-from utils import run_epubcheck, count_errors
+from utils import run_epubcheck, count_errors, fix_unclosed_br_tags
 import shutil
 import sys
 import tempfile
@@ -161,6 +161,9 @@ def fix_html_content(content):
     """Apply all HTML fixes in one pass"""
     # CRITICAL: Fix mangled tags FIRST - these cause fatal parsing errors
     content = fix_mangled_p_tags(content)
+    
+    # Fix raw <br> tags before other HTML cleanup
+    content = fix_unclosed_br_tags(content)
     
     # Then fix unclosed tags
     content = fix_unclosed_anchor_tags(content)
