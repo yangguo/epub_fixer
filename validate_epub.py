@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Simple EPUB validation script"""
 
-import sys
 import os
+import sys
 
-from utils import run_epubcheck, count_errors
+from config import EPUBCHECK_JAR
+from utils import count_errors, run_epubcheck
+
 
 def main():
     """Main function"""
@@ -17,8 +19,8 @@ def main():
         print(f"Error: File not found - {epub_path}")
         sys.exit(1)
     
-    if not os.path.exists("epubcheck.jar"):
-        print("Error: epubcheck.jar not found in current directory")
+    if not os.path.exists(EPUBCHECK_JAR):
+        print(f"Error: epubcheck.jar not found at {EPUBCHECK_JAR}")
         sys.exit(1)
     
     print(f"Validating: {epub_path}")

@@ -15,23 +15,264 @@ Updated to fix:
 Successfully tested on college1.epub - fixes all 93 errors in one pass.
 """
 
+import argparse
 import os
+import posixpath
 import re
-import zipfile
-
-from utils import run_epubcheck, count_errors
 import shutil
 import sys
 import tempfile
-import subprocess
-from pathlib import Path
+import zipfile
+from urllib.parse import unquote, urlsplit
 
+from config import EPUBCHECK_JAR
+from utils import count_errors, run_epubcheck
+
+
+SUPPORTED_TARGET_VERSIONS = {"auto", "epub2", "epub3"}
+
+
+def detect_epub_version(opf_content):
+    """Return the package version declared by an OPF document, if present."""
+    match = re.search(
+        r"<package\b[^>]*\bversion\s*=\s*(['\"])([^'\"]+)\1",
+        opf_content or "",
+        flags=re.IGNORECASE,
+    )
+    return match.group(2) if match else None
+
+
+def resolve_target_version(target_version="auto", opf_content=None):
+    """Resolve a compatible repair policy from the requested target/package."""
+    target = (target_version or "auto").strip().lower()
+    if target not in SUPPORTED_TARGET_VERSIONS:
+        choices = ", ".join(sorted(SUPPORTED_TARGET_VERSIONS))
+        raise ValueError(f"target_version must be one of: {choices}")
+
+    package_version = detect_epub_version(opf_content)
+    package_target = (
+        "epub2" if package_version and package_version.startswith("2") else "epub3"
+    )
+    if target != "auto" and package_version and target != package_target:
+        raise ValueError(
+            f"target_version={target} conflicts with package version "
+            f"{package_version}; use target_version=auto or match the package"
+        )
+    return package_target if target == "auto" else target
+
+
+def _get_attribute(tag, name):
+    """Read one XML-style attribute from a tag while preserving malformed input."""
+    match = re.search(
+        rf"(?<![\w:.-]){re.escape(name)}\s*=\s*(['\"])(.*?)\1",
+        tag,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    return match.group(2) if match else None
+
+
+def _replace_attribute(tag, name, value):
+    """Replace an existing attribute value and preserve its quote style."""
+    pattern = re.compile(
+        rf"(?P<prefix>(?<![\w:.-]){re.escape(name)}\s*=\s*)(?P<quote>['\"])(?P<value>.*?)(?P=quote)",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    return pattern.sub(
+        lambda match: (
+            f"{match.group('prefix')}{match.group('quote')}"
+            f"{value}{match.group('quote')}"
+        ),
+        tag,
+        count=1,
+    )
+
+
+def _add_attribute(tag, name, value):
+    """Add an attribute before a tag's closing marker."""
+    closing = re.search(r"\s*/?>\s*$", tag, flags=re.DOTALL)
+    if not closing:
+        return tag
+    prefix = tag[:closing.start()].rstrip()
+    return f'{prefix} {name}="{value}"{closing.group(0)}'
+
+
+def _remove_attribute(tag, name):
+    """Remove one XML-style attribute from a tag."""
+    return re.sub(
+        rf"\s+(?<![\w:.-]){re.escape(name)}\s*=\s*(['\"])(.*?)\1",
+        "",
+        tag,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+
+def _manifest_items(opf_content):
+    """Return manifest item records without requiring a strict XML parser."""
+    items = []
+    for match in re.finditer(r"<item\b[^>]*?/?>", opf_content, flags=re.IGNORECASE | re.DOTALL):
+        tag = match.group(0)
+        item_id = _get_attribute(tag, "id")
+        href = _get_attribute(tag, "href")
+        media_type = _get_attribute(tag, "media-type")
+        if not item_id or not href:
+            continue
+        properties = (_get_attribute(tag, "properties") or "").split()
+        items.append(
+            {
+                "id": item_id,
+                "href": href,
+                "media_type": media_type or "",
+                "properties": properties,
+                "start": match.start(),
+                "end": match.end(),
+            }
+        )
+    return items
+
+
+def _cover_metadata_ids(opf_content):
+    """Return legacy cover metadata values in document order."""
+    values = []
+    for match in re.finditer(r"<meta\b[^>]*?/?>", opf_content, flags=re.IGNORECASE | re.DOTALL):
+        tag = match.group(0)
+        if (_get_attribute(tag, "name") or "").lower() == "cover":
+            value = _get_attribute(tag, "content")
+            if value:
+                values.append(value)
+    return values
+
+
+def _choose_cover_item(opf_content):
+    """Choose a cover image only when the package gives us useful evidence."""
+    items = _manifest_items(opf_content)
+    if not items:
+        return None
+
+    legacy_ids = set(_cover_metadata_ids(opf_content))
+    scored = []
+    for item in items:
+        media_type = item["media_type"].lower()
+        if not media_type.startswith("image/"):
+            continue
+        item_id = item["id"]
+        href = item["href"]
+        score = 0
+        if "cover-image" in item["properties"]:
+            score += 100
+        if item_id in legacy_ids:
+            score += 90
+        if "cover" in item_id.lower():
+            score += 50
+        if "cover" in posixpath.basename(href).lower():
+            score += 40
+        if score:
+            scored.append((score, item))
+
+    return max(scored, key=lambda entry: entry[0])[1] if scored else None
+
+
+def fix_cover_metadata(content, target_version="auto"):
+    """Make legacy and EPUB 3 cover metadata point to the same image item."""
+    resolved_target = resolve_target_version(target_version, content)
+    cover_item = _choose_cover_item(content)
+    if not cover_item:
+        return content
+
+    cover_id = cover_item["id"]
+    item_pattern = re.compile(r"<item\b[^>]*?/?>", flags=re.IGNORECASE | re.DOTALL)
+
+    def update_cover_item(match):
+        tag = match.group(0)
+        if _get_attribute(tag, "id") != cover_id:
+            return tag
+
+        properties = (_get_attribute(tag, "properties") or "").split()
+        if resolved_target == "epub3":
+            if "cover-image" not in properties:
+                properties.append("cover-image")
+            new_properties = " ".join(properties)
+            if _get_attribute(tag, "properties") is None:
+                return _add_attribute(tag, "properties", new_properties)
+            return _replace_attribute(tag, "properties", new_properties)
+
+        properties = [value for value in properties if value != "cover-image"]
+        if properties:
+            return _replace_attribute(tag, "properties", " ".join(properties))
+        return _remove_attribute(tag, "properties")
+
+    content = item_pattern.sub(update_cover_item, content)
+
+    meta_pattern = re.compile(r"<meta\b[^>]*?/?>", flags=re.IGNORECASE | re.DOTALL)
+    found_legacy_meta = False
+
+    def update_cover_meta(match):
+        nonlocal found_legacy_meta
+        tag = match.group(0)
+        if (_get_attribute(tag, "name") or "").lower() != "cover":
+            return tag
+        found_legacy_meta = True
+        if _get_attribute(tag, "content") is None:
+            return _add_attribute(tag, "content", cover_id)
+        return _replace_attribute(tag, "content", cover_id)
+
+    content = meta_pattern.sub(update_cover_meta, content)
+
+    if found_legacy_meta:
+        return content
+
+    metadata_match = re.search(
+        r"(<(?:[\w.-]+:)?metadata\b[^>]*>)(.*?)(</(?:[\w.-]+:)?metadata\s*>)",
+        content,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not metadata_match:
+        return content
+
+    inner = metadata_match.group(2)
+    indent_match = re.search(r"\n([ \t]+)<", inner)
+    indent = indent_match.group(1) if indent_match else "  "
+    stripped_inner = inner.rstrip()
+    trailing = inner[len(stripped_inner):]
+    inserted_inner = f'{stripped_inner}\n{indent}<meta name="cover" content="{cover_id}"/>{trailing}'
+    return (
+        content[:metadata_match.start(2)]
+        + inserted_inner
+        + content[metadata_match.end(2):]
+    )
 
 
 def extract_epub(epub_path, extract_dir):
     """Extract EPUB with proper structure"""
     with zipfile.ZipFile(epub_path, 'r') as zip_ref:
         zip_ref.extractall(extract_dir)
+
+
+def find_opf_file(extract_dir):
+    """Find the package document via container.xml, with a safe fallback."""
+    container_path = os.path.join(extract_dir, "META-INF", "container.xml")
+    if os.path.exists(container_path):
+        with open(container_path, "r", encoding="utf-8") as container_file:
+            container = container_file.read()
+        rootfile_match = re.search(
+            r"<rootfile\b[^>]*\bfull-path\s*=\s*(['\"])(.*?)\1",
+            container,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if rootfile_match:
+            candidate = os.path.join(
+                extract_dir, rootfile_match.group(2).replace("/", os.sep)
+            )
+            if os.path.isfile(candidate):
+                return candidate
+
+    candidates = []
+    for root, _, files in os.walk(extract_dir):
+        candidates.extend(
+            os.path.join(root, file)
+            for file in files
+            if file.lower().endswith(".opf")
+        )
+    return sorted(candidates)[0] if candidates else None
 
 def repack_epub(extract_dir, epub_path):
     """Repack EPUB with correct mimetype handling"""
@@ -64,36 +305,170 @@ def build_fragment_index(extract_dir):
             if '<html' not in content.lower():
                 continue
             rel_path = os.path.relpath(file_path, extract_dir).replace('\\', '/')
-            fragment_index[rel_path] = set(re.findall(r'id="([^"]+)"', content))
+            fragment_index[rel_path] = set(
+                re.findall(r'\b(?:id|xml:id)\s*=\s*["\']([^"\']+)["\']', content)
+            )
     return fragment_index
 
-def fix_invalid_id_attributes(content):
-    """Fix invalid XML ID attributes - must not contain colons or start with numbers."""
-    def fix_id(match):
-        prefix = match.group(1)
-        id_value = match.group(2)
-        suffix = match.group(3)
+def _normalize_id_value(value):
+    """Return the legacy-safe spelling used for an XML identifier."""
+    if not value:
+        return value
+    value = value.replace(":", "_")
+    if value[0].isdigit():
+        value = f"id_{value}"
+    return value
 
-        if not id_value:
+
+def _normalize_ids_with_mapping(content):
+    """Normalize IDs and return the old-to-new mapping for reference repair."""
+    rewrites = {}
+    id_pattern = re.compile(
+        r"(?P<prefix>(?<![:\w.-])\bid\s*=\s*)"
+        r"(?P<quote>[\"'])(?P<value>.*?)(?P=quote)",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    def normalize_id(match):
+        old_value = match.group("value")
+        new_value = _normalize_id_value(old_value)
+        if old_value and new_value != old_value:
+            rewrites[old_value] = new_value
+        return (
+            f'{match.group("prefix")}{match.group("quote")}'
+            f'{new_value}{match.group("quote")}'
+        )
+
+    content = id_pattern.sub(normalize_id, content)
+
+    idref_pattern = re.compile(
+        r"(?P<prefix>(?<![:\w.-])\bidref\s*=\s*)"
+        r"(?P<quote>[\"'])(?P<value>.*?)(?P=quote)",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    def normalize_idref(match):
+        values = match.group("value").split()
+        normalized_values = [
+            rewrites.get(value, _normalize_id_value(value)) for value in values
+        ]
+        new_value = " ".join(normalized_values)
+        return (
+            f'{match.group("prefix")}{match.group("quote")}'
+            f'{new_value}{match.group("quote")}'
+        )
+
+    content = idref_pattern.sub(normalize_idref, content)
+    return content, rewrites
+
+
+def _replace_url_fragment(value, rewrites):
+    """Replace a URL fragment when it matches one of the renamed IDs."""
+    parsed = urlsplit(value)
+    if parsed.scheme or value.startswith("//") or not parsed.fragment:
+        return value
+    replacement = rewrites.get(unquote(parsed.fragment))
+    return parsed._replace(fragment=replacement).geturl() if replacement else value
+
+
+def _replace_id_references(content, rewrites):
+    """Update local fragments, IDREF attributes, and legacy cover metadata."""
+    if not rewrites:
+        return content
+
+    idref_attributes = (
+        "for",
+        "headers",
+        "idref",
+        "aria-labelledby",
+        "aria-describedby",
+        "aria-controls",
+        "aria-owns",
+        "aria-flowto",
+        "aria-details",
+        "aria-errormessage",
+        "aria-activedescendant",
+    )
+    attribute_pattern = re.compile(
+        r"(?P<prefix>\b(?P<name>href|src|"
+        + "|".join(re.escape(name) for name in idref_attributes)
+        + r")\s*=\s*)"
+        r"(?P<quote>[\"'])(?P<value>.*?)(?P=quote)",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    def replace_reference(match):
+        name = match.group("name").lower()
+        value = match.group("value")
+        new_value = value
+        if name in {"href", "src"}:
+            new_value = _replace_url_fragment(value, rewrites)
+        else:
+            values = value.split()
+            new_value = " ".join(rewrites.get(item, item) for item in values)
+
+        if new_value == value:
             return match.group(0)
+        return (
+            f'{match.group("prefix")}{match.group("quote")}'
+            f'{new_value}{match.group("quote")}'
+        )
 
-        # Replace colons with underscores
-        if ':' in id_value:
-            id_value = id_value.replace(':', '_')
+    content = attribute_pattern.sub(replace_reference, content)
 
-        # If ID starts with a number, prefix with 'id_'
-        if id_value and id_value[0].isdigit():
-            id_value = f'id_{id_value}'
+    meta_pattern = re.compile(r"<meta\b[^>]*?/?>", flags=re.IGNORECASE | re.DOTALL)
 
-        return f'{prefix}{id_value}{suffix}'
+    def replace_cover_meta(match):
+        tag = match.group(0)
+        if (_get_attribute(tag, "name") or "").lower() != "cover":
+            return tag
+        value = _get_attribute(tag, "content")
+        replacement = rewrites.get(value)
+        return _replace_attribute(tag, "content", replacement) if replacement else tag
 
-    # Fix id attributes in all HTML tags (body, div, span, etc.)
-    content = re.sub(r'(\bid\s*=\s*")([^"]*)(")', fix_id, content, flags=re.IGNORECASE)
+    return meta_pattern.sub(replace_cover_meta, content)
 
-    # Fix idref attributes to match renamed IDs (spine, guide, NCX references)
-    content = re.sub(r'(\bidref\s*=\s*")([^"]*)(")', fix_id, content, flags=re.IGNORECASE)
 
-    return content
+def fix_invalid_id_attributes(content):
+    """Normalize XML IDs and keep local references aligned with renamed IDs."""
+    content, rewrites = _normalize_ids_with_mapping(content)
+    return _replace_id_references(content, rewrites)
+
+
+def fix_invalid_aria_idrefs(content):
+    """Keep valid ARIA ID references and drop only references that do not exist."""
+    existing_ids = set(
+        re.findall(r'\b(?:id|xml:id)\s*=\s*["\']([^"\']+)["\']', content)
+    )
+    idref_attributes = (
+        "labelledby",
+        "describedby",
+        "controls",
+        "owns",
+        "flowto",
+        "details",
+        "errormessage",
+        "activedescendant",
+    )
+    attribute_pattern = re.compile(
+        r'(?P<prefix>\baria-(?:' + "|".join(idref_attributes) + r')\s*=\s*)'
+        r'(?P<quote>["\'])(?P<value>.*?)(?P=quote)',
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    def repair(match):
+        values = match.group("value").split()
+        valid_values = [value for value in values if value in existing_ids]
+        if not valid_values:
+            return ""
+        if valid_values == values:
+            return match.group(0)
+        return (
+            f'{match.group("prefix")}{match.group("quote")}'
+            f'{" ".join(valid_values)}{match.group("quote")}'
+        )
+
+    return attribute_pattern.sub(repair, content)
 
 def fix_dir_attributes(content):
     """Fix invalid dir attribute values"""
@@ -157,8 +532,9 @@ def fix_mangled_p_tags(content):
     # Matches <p followed by lowercase letters/numbers (common class names)
     return re.sub(r'<p([a-z0-9]+)', r'<p class="\1"', content)
 
-def fix_html_content(content):
-    """Apply all HTML fixes in one pass"""
+def fix_html_content(content, target_version="epub3"):
+    """Apply repair rules while preserving EPUB 3 semantics by default."""
+    target_version = resolve_target_version(target_version, content)
     # CRITICAL: Fix mangled tags FIRST - these cause fatal parsing errors
     content = fix_mangled_p_tags(content)
     
@@ -166,14 +542,16 @@ def fix_html_content(content):
     content = fix_unclosed_anchor_tags(content)
     content = fix_unclosed_p_tags(content)
     
-    # Fix invalid ID attributes (no colons allowed in XML names)
-    content = fix_invalid_id_attributes(content)
+    # Fix invalid IDs and keep fragment/ARIA references aligned with renames.
+    content, id_rewrites = _normalize_ids_with_mapping(content)
+    content = _replace_id_references(content, id_rewrites)
+    content = fix_invalid_aria_idrefs(content)
     
     # First fix dir attributes
     content = fix_dir_attributes(content)
     
     # Fix malformed head tags first
-    content = re.sub(r'</head[^>]*>', '</head>', content, flags=re.IGNORECASE)
+    content = re.sub(r'</head\b[^>]*>', '</head>', content, flags=re.IGNORECASE)
     
     def fix_meta_value_attributes(text):
         def replace_tag(m):
@@ -199,9 +577,10 @@ def fix_html_content(content):
         if 'xmlns=' not in html_tag:
             # Add XHTML namespace as first attribute after html tag
             return re.sub(r'<html', '<html xmlns="http://www.w3.org/1999/xhtml"', html_tag, flags=re.IGNORECASE)
-        # Remove problematic attributes from html tag
-        html_tag = re.sub(r'\s+class="[^"]*"', '', html_tag, flags=re.IGNORECASE)
-        html_tag = re.sub(r'\s+epub:prefix="[^"]*"', '', html_tag, flags=re.IGNORECASE)
+        # EPUB 3 metadata and classes are meaningful; only strip the legacy
+        # prefix when the caller explicitly requests EPUB 2 compatibility.
+        if target_version == "epub2":
+            html_tag = re.sub(r'\s+epub:prefix="[^"]*"', '', html_tag, flags=re.IGNORECASE)
         return html_tag
     
     content = re.sub(r'<html[^>]*>', fix_html_namespace, content, flags=re.IGNORECASE)
@@ -209,61 +588,39 @@ def fix_html_content(content):
     # Fix structural issues - move misplaced elements
     content = fix_structural_issues(content)
     
-    # EPUB 2.0.1 compatibility fixes
-    # Protect toc nav elements (required by EPUB 3 spec) from conversion to div.
-    # Replace the entire toc nav block with a placeholder token before fixes,
-    # then restore it after the EPUB2 compatibility pass.
-    toc_nav_blocks = []
-    def save_toc_nav(match):
-        toc_nav_blocks.append(match.group(0))
-        return f'%%TOC_NAV_BLOCK_{len(toc_nav_blocks) - 1}%%'
-    content = re.sub(
-        r'<nav\s+epub:type="toc".*?</nav>',
-        save_toc_nav,
-        content,
-        flags=re.DOTALL | re.IGNORECASE
-    )
+    fixes = []
+    if target_version == "epub2":
+        fixes.extend([
+            # Remove EPUB 3-specific semantics only in explicit EPUB 2 mode.
+            (r'<head\b[^>]*\s+epub:prefix="[^"]*"([^>]*)>', r'<head\1>'),
+            (r'<head\b[^>]*\s+class="[^"]*"([^>]*)>', r'<head\1>'),
+            (r'<body[^>]*\s+epub:type="[^"]*"([^>]*)>', r'<body\1>'),
+            (r'\s+epub:type="[^"]*"', ''),
+            (r'\s+epub:prefix="[^"]*"', ''),
+            (r'\s+data-number="[^"]*"', ''),
+            (r'\s+hidden(?:="[^"]*")?', ''),
+            (r'\s+aria-[a-z-]*="[^"]*"', ''),
+            (r'\s+role="[^"]*"', ''),
+            (r'<section([^>]*)>', r'<div\1>'),
+            (r'</section>', '</div>'),
+            (r'<nav([^>]*)>', r'<div\1>'),
+            (r'</nav>', '</div>'),
+            (r'<figure([^>]*)>', r'<div\1>'),
+            (r'</figure>', '</div>'),
+            (r'<figcaption([^>]*)>', r'<div\1>'),
+            (r'</figcaption>', '</div>'),
+            (r'<aside([^>]*)>', r'<div\1>'),
+            (r'</aside>', '</div>'),
+            (r'<header([^>]*)>', r'<div\1>'),
+            (r'</header>', '</div>'),
+        ])
 
-    fixes = [
-        # Remove EPUB 3 specific attributes from head tags  
-        (r'<head[^>]*\s+epub:prefix="[^"]*"([^>]*)>', r'<head\1>'),
-        (r'<head[^>]*\s+class="[^"]*"([^>]*)>', r'<head\1>'),
-        
-        # Remove EPUB 3 specific attributes from body tags  
-        (r'<body[^>]*\s+epub:type="[^"]*"([^>]*)>', r'<body\1>'),
-        
-        # General EPUB 3 attribute removal
-        (r'\s+epub:type="[^"]*"', ''),  # Remove epub:type
-        (r'\s+epub:prefix="[^"]*"', ''),  # Remove epub:prefix
-        (r'\s+data-number="[^"]*"', ''),  # Remove data-number
-        (r'\s+hidden(?:="[^"]*")?', ''),  # Remove hidden attributes
-        (r'\s+aria-[a-z-]*="[^"]*"', ''),  # Remove aria attributes
-        (r'\s+role="[^"]*"', ''),  # Remove role attributes
-        
-        # HTML5 to HTML4 element conversion
-        (r'<section([^>]*)>', r'<div\1>'),  # Convert section to div
-        (r'</section>', '</div>'),
-        (r'<nav([^>]*)>', r'<div\1>'),  # Convert nav to div
-        (r'</nav>', '</div>'),
-        (r'<figure([^>]*)>', r'<div\1>'),  # Convert figure to div
-        (r'</figure>', '</div>'),
-        (r'<figcaption([^>]*)>', r'<div\1>'),  # Convert figcaption to div
-        (r'</figcaption>', '</div>'),
-        (r'<aside([^>]*)>', r'<div\1>'),  # Convert aside to div
-        (r'</aside>', '</div>'),
-        (r'<header([^>]*)>', r'<div\1>'),  # Convert header to div
-        (r'</header>', '</div>'),
-        
-        # Fix style tags
-        (r'<style(?![^>]*type=)([^>]*)>', r'<style type="text/css"\1>'),
-    ]
+    # XHTML 1-compatible style markup is harmless in EPUB 3 and useful for
+    # EPUB 2 readers, so keep this repair in both modes.
+    fixes.append((r'<style(?![^>]*type=)([^>]*)>', r'<style type="text/css"\1>'))
     
     for pattern, replacement in fixes:
         content = re.sub(pattern, replacement, content, flags=re.IGNORECASE)
-
-    # Restore protected toc nav blocks
-    for i, block in enumerate(toc_nav_blocks):
-        content = content.replace(f'%%TOC_NAV_BLOCK_{i}%%', block)
 
     # Fix malformed sup tags (e.g., <sup>1</a></sup> -> <sup>1</sup>)
     content = fix_malformed_sup_tags(content)
@@ -278,12 +635,6 @@ def fix_html_content(content):
         content
     )
 
-    # Remove references to missing CSS files
-    content = re.sub(r'<link[^>]*href="[^"]*WileyTemplate_v5\.1\.css"[^>]*/?>', '', content, flags=re.IGNORECASE)
-    
-    # Remove references to missing image files
-    content = re.sub(r'<img[^>]*src="[^"]*images/cover_fmt\.jpg"[^>]*/?>', '', content, flags=re.IGNORECASE)
-    
     # Fix incomplete body elements - ensure body has proper content
     content = fix_incomplete_body(content)
     
@@ -329,7 +680,7 @@ def fix_structural_issues(content):
     """Fix structural issues like misplaced head/h1 elements and missing titles"""
     # Move h1 elements from head to body
     # Find head section and extract h1 elements
-    head_match = re.search(r'<head[^>]*>(.*?)</head>', content, re.DOTALL | re.IGNORECASE)
+    head_match = re.search(r'<head\b[^>]*>(.*?)</head\b>', content, re.DOTALL | re.IGNORECASE)
     if head_match:
         head_content = head_match.group(1)
         # Extract h1 elements from head
@@ -345,7 +696,7 @@ def fix_structural_issues(content):
                 content = re.sub(r'<body[^>]*>', f'<body>\\n{h1}', content, flags=re.IGNORECASE)
     
     # Ensure head has a title element
-    head_match = re.search(r'<head[^>]*>(.*?)</head>', content, re.DOTALL | re.IGNORECASE)
+    head_match = re.search(r'<head\b[^>]*>(.*?)</head\b>', content, re.DOTALL | re.IGNORECASE)
     if head_match:
         head_content = head_match.group(1)
         if not re.search(r'<title[^>]*>.*?</title>', head_content, re.DOTALL | re.IGNORECASE):
@@ -355,7 +706,7 @@ def fix_structural_issues(content):
     
     # Fix duplicate head elements (remove misplaced ones)
     # Keep only the first head element, remove others
-    head_matches = list(re.finditer(r'<head[^>]*>.*?</head>', content, re.DOTALL | re.IGNORECASE))
+    head_matches = list(re.finditer(r'<head\b[^>]*>.*?</head\b>', content, re.DOTALL | re.IGNORECASE))
     if len(head_matches) > 1:
         # Remove all but the first head
         for i in range(1, len(head_matches)):
@@ -530,31 +881,84 @@ def ensure_image_alt_attributes(content):
 
     return img_pattern.sub(add_alt, content)
 
-def fix_fragment_identifiers(content, file_path):
-    """Fix broken internal links and fragments by removing undefined fragment references"""
-    # Extract existing IDs
-    existing_ids = set(re.findall(r'id="([^"]+)"', content))
-    
+def fix_fragment_identifiers(
+    content,
+    file_path,
+    fragment_index=None,
+    root_dir=None,
+    fragment_rewrites=None,
+):
+    """Remove a fragment only when the target document is known and missing it."""
+    fragment_index = fragment_index or {}
+    fragment_rewrites = fragment_rewrites or {}
+    current_path = file_path.replace("\\", "/")
+    if root_dir and os.path.isabs(file_path):
+        current_path = os.path.relpath(file_path, root_dir).replace("\\", "/")
+    current_ids = fragment_index.get(current_path)
+    if current_ids is None:
+        current_ids = set(
+            re.findall(r'\b(?:id|xml:id)\s*=\s*["\']([^"\']+)["\']', content)
+        )
+
     def fix_href(match):
-        href = match.group(1)
-        if '#' in href:
-            parts = href.rsplit('#', 1)
-            if len(parts) == 2:
-                file_part, fragment = parts
-                # If it's a local reference (same file or no file specified)
-                if not file_part or file_part.endswith(('.xhtml', '.html', '.htm')):
-                    # Check if fragment exists
-                    if fragment and fragment not in existing_ids:
-                        # Remove the fragment part
-                        if file_part:
-                            return f'href="{file_part}"'
-                        else:
-                            # Just # with no file - remove entire href or make it point to self
-                            return 'href="#"'
-        return match.group(0)
-    
-    content = re.sub(r'href="([^"]*)"', fix_href, content)
-    return content
+        href = match.group("href")
+        if "#" not in href:
+            return match.group(0)
+
+        parsed = urlsplit(href)
+        if parsed.scheme or href.startswith("//") or href.startswith(("data:", "mailto:")):
+            return match.group(0)
+
+        file_part = parsed.path
+        fragment = unquote(parsed.fragment)
+        if not fragment:
+            return match.group(0)
+
+        if file_part:
+            target_path = posixpath.normpath(
+                posixpath.join(posixpath.dirname(current_path), unquote(file_part))
+            )
+            target_rewrites = fragment_rewrites.get(target_path, {})
+            replacement = target_rewrites.get(fragment)
+            if replacement:
+                replacement_href = _replace_url_fragment(
+                    href, {fragment: replacement}
+                )
+                return (
+                    f'{match.group("prefix")}{match.group("quote")}'
+                    f'{replacement_href}{match.group("quote")}'
+                )
+            target_ids = fragment_index.get(target_path)
+            # Unknown targets are left untouched: guessing here can destroy a
+            # valid link when a package uses an extension or path variant.
+            if target_ids is None or fragment in target_ids:
+                return match.group(0)
+        else:
+            replacement = fragment_rewrites.get(current_path, {}).get(fragment)
+            if replacement:
+                replacement_href = _replace_url_fragment(
+                    href, {fragment: replacement}
+                )
+                return (
+                    f'{match.group("prefix")}{match.group("quote")}'
+                    f'{replacement_href}{match.group("quote")}'
+                )
+            target_ids = current_ids
+            if fragment in target_ids:
+                return match.group(0)
+
+        replacement_href = file_part or "#"
+        return (
+            f'{match.group("prefix")}{match.group("quote")}'
+            f'{replacement_href}{match.group("quote")}'
+        )
+
+    return re.sub(
+        r'(?P<prefix>\bhref\s*=\s*)(?P<quote>["\'])(?P<href>.*?)(?P=quote)',
+        fix_href,
+        content,
+        flags=re.IGNORECASE,
+    )
 
 def fix_ncx_identifier(content, opf_content=None):
     """Fix NCX identifier to match OPF identifier"""
@@ -574,24 +978,21 @@ def fix_ncx_identifier(content, opf_content=None):
             )
     return content
 
-def fix_ncx_file(content, opf_content=None, fragment_index=None, current_path=None):
+def fix_ncx_file(
+    content,
+    opf_content=None,
+    fragment_index=None,
+    current_path=None,
+    fragment_rewrites=None,
+):
     """Fix NCX navigation issues - IDs with colons, playOrder, and pageList class"""
     
     # Fix NCX identifier to match OPF
     content = fix_ncx_identifier(content, opf_content)
     
-    # Fix 1: Fix invalid XML IDs (must not start with numbers, no colons)
-    def fix_id(match):
-        id_value = match.group(1)
-        # If ID starts with a number, prefix with 'id_'
-        if id_value and id_value[0].isdigit():
-            id_value = f'id_{id_value}'
-        # Replace colons with underscores
-        if ':' in id_value:
-            id_value = id_value.replace(':', '_')
-        return f'id="{id_value}"'
-    
-    content = re.sub(r'id="([^"]*)"', fix_id, content)
+    # Fix IDs and references together so NCX anchors remain navigable.
+    content, id_rewrites = _normalize_ids_with_mapping(content)
+    content = _replace_id_references(content, id_rewrites)
     
     # Fix 2: Ensure pageList has exactly ONE class attribute (fix duplicate class issue)
     lines = content.split('\n')
@@ -660,21 +1061,27 @@ def fix_ncx_file(content, opf_content=None, fragment_index=None, current_path=No
     content = '\n'.join(lines)
     
     # Remove fragment identifiers that point to missing anchors
-    if fragment_index is not None and current_path is not None:
+    if current_path is not None:
+        fragment_index = fragment_index or {}
+        fragment_rewrites = fragment_rewrites or {}
         base_dir = os.path.dirname(current_path)
         def fix_content_src(match):
             prefix, src_value, suffix = match.groups()
-            if '#' not in src_value:
+            parsed = urlsplit(src_value)
+            if not parsed.fragment:
                 return match.group(0)
-            file_part, fragment = src_value.split('#', 1)
-            fragment = fragment.strip()
+            file_part = parsed.path
+            fragment = unquote(parsed.fragment.strip())
             normalized_target = os.path.normpath(
                 os.path.join(base_dir, file_part)
             ).replace('\\', '/')
+            replacement = fragment_rewrites.get(normalized_target, {}).get(fragment)
+            if replacement:
+                return f'{prefix}{parsed._replace(fragment=replacement).geturl()}{suffix}'
             ids = fragment_index.get(normalized_target)
-            if not fragment or not ids or fragment not in ids:
-                return f'{prefix}{file_part}{suffix}'
-            return match.group(0)
+            if not fragment or ids is None or fragment in ids:
+                return match.group(0)
+            return f'{prefix}{parsed._replace(fragment="").geturl().rstrip("#")}{suffix}'
         content = re.sub(
             r'(<content\s+src=")([^"]*)(")',
             fix_content_src,
@@ -684,28 +1091,52 @@ def fix_ncx_file(content, opf_content=None, fragment_index=None, current_path=No
     
     return content
 
-def fix_opf_file(content):
-    """Fix OPF file issues - remove invalid attributes and ensure proper structure"""
-    # Fix 1: Remove page-map attribute from spine element (not allowed in EPUB 2.0.1)
-    content = re.sub(r'<spine([^>]*)\s+page-map="[^"]*"([^>]*)>', r'<spine\1\2>', content)
+def fix_opf_file(content, target_version="auto"):
+    """Repair OPF references without changing the package version."""
+    target_version = resolve_target_version(target_version, content)
 
-    # Fix 2: Fix invalid XML IDs that start with numbers or contain colons
-    content = fix_invalid_id_attributes(content)
+    # EPUB 3 removed the EPUB 2 page-map spine attribute. Keep it when the
+    # package is intentionally being handled as EPUB 2.
+    if target_version == "epub3":
+        content = re.sub(r'<spine([^>]*)\s+page-map="[^"]*"([^>]*)>', r'<spine\1\2>', content)
 
-    # Fix 3: Change non-standard "text/html" to "application/xhtml+xml" for EPUB 3
-    # (EPUB 3 requires application/xhtml+xml for XHTML content documents)
+    # Fix package IDs and keep idref/cover metadata aligned with renames.
+    content, id_rewrites = _normalize_ids_with_mapping(content)
+    content = _replace_id_references(content, id_rewrites)
+
+    # XHTML content documents should be advertised with the XHTML media type
+    # in both EPUB generations.
     content = content.replace('media-type="text/html"', 'media-type="application/xhtml+xml"')
 
-    # Fix 4: Make non-linear cover items linear so they are reachable (fixes OPF-096)
+    # Keep the cover page reachable from the reading order.
+    def make_cover_linear(match):
+        tag = match.group(0)
+        idref = _get_attribute(tag, "idref") or ""
+        if "cover" in idref.lower() and (_get_attribute(tag, "linear") or "").lower() == "no":
+            return _remove_attribute(tag, "linear")
+        return tag
+
     content = re.sub(
-        r'(<itemref\s+idref="[^"]*cover[^"]*")\s+linear="no"',
-        r'\1',
-        content
+        r"<itemref\b[^>]*?/?>",
+        make_cover_linear,
+        content,
+        flags=re.IGNORECASE | re.DOTALL,
     )
 
-    # Fix 5: Ensure all referenced items are in spine
-    manifest_items = re.findall(r'<item[^>]*id="([^"]*)"[^>]*href="([^"]*cover\.xhtml[^"]*)"', content, re.IGNORECASE)
-    spine_items = re.findall(r'<itemref[^>]*idref="([^"]*)"', content)
+    # Repair the exact mismatch that made clearing.epub invisible to some
+    # readers: legacy metadata must reference the real manifest item id.
+    content = fix_cover_metadata(content, target_version)
+
+    # Ensure cover pages are reachable when a package explicitly names one.
+    manifest_items = [
+        (item["id"], item["href"])
+        for item in _manifest_items(content)
+        if "cover.xhtml" in item["href"].lower()
+    ]
+    spine_items = [
+        _get_attribute(match.group(0), "idref")
+        for match in re.finditer(r"<itemref\b[^>]*?/?>", content, re.IGNORECASE | re.DOTALL)
+    ]
 
     for item_id, href in manifest_items:
         if item_id not in spine_items:
@@ -713,8 +1144,11 @@ def fix_opf_file(content):
 
     return content
 
-def fix_missing_file_references(content):
-    """Remove references to files that don't exist in the EPUB"""
+def fix_missing_file_references(content, source_path=None, available_paths=None):
+    """Remove known-bad references only after checking the package file set."""
+    if not available_paths:
+        return content
+
     # List of missing files based on the error output
     missing_patterns = [
         # Missing HTML files
@@ -739,16 +1173,34 @@ def fix_missing_file_references(content):
         r'<img[^>]*src="[^"]*f\d{4}-\d{2}\.jpg[^"]*"[^>]*/?>',
         r'<img[^>]*src="[^"]*t\d{4}-\d{2}\.jpg[^"]*"[^>]*/?>',
         r'<img[^>]*src="[^"]*pub\.jpg[^"]*"[^>]*/?>',
+        r'<img[^>]*src="[^"]*images/cover_fmt\.jpg[^"]*"[^>]*/?>',
         
         # Missing font files
         r'<[^>]*href="[^"]*CharisSIL[ABIR]\.ttf[^"]*"[^>]*/?>',
         
         # Missing CSS files
+        r'<link[^>]*href="[^"]*WileyTemplate_v5\.1\.css[^"]*"[^>]*/?>',
         r'<link[^>]*href="[^"]*page-template\.xpgt[^"]*"[^>]*/?>',
     ]
 
+    source_path = (source_path or "").replace("\\", "/")
+    source_dir = posixpath.dirname(source_path)
+
+    def remove_if_missing(match):
+        tag = match.group(0)
+        reference = _get_attribute(tag, "href") or _get_attribute(tag, "src")
+        if not reference:
+            return tag
+        parsed = urlsplit(reference)
+        if parsed.scheme or reference.startswith("//") or not parsed.path:
+            return tag
+        target_path = posixpath.normpath(
+            posixpath.join(source_dir, unquote(parsed.path))
+        )
+        return "" if target_path not in available_paths else tag
+
     for pattern in missing_patterns:
-        content = re.sub(pattern, '', content, flags=re.IGNORECASE)
+        content = re.sub(pattern, remove_if_missing, content, flags=re.IGNORECASE)
 
     return content
 
@@ -772,8 +1224,16 @@ def fix_css_file(content):
     
     return content
 
-def process_file(file_path, opf_content=None, fragment_index=None, root_dir=None):
-    """Process single file (XHTML, NCX, OPF, or CSS)"""
+def process_file(
+    file_path,
+    opf_content=None,
+    fragment_index=None,
+    root_dir=None,
+    target_version="epub3",
+    available_paths=None,
+    fragment_rewrites=None,
+):
+    """Process one EPUB resource using the selected compatibility policy."""
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
             content = f.read()
@@ -783,8 +1243,15 @@ def process_file(file_path, opf_content=None, fragment_index=None, root_dir=None
         if root_dir:
             rel_path = os.path.relpath(file_path, root_dir).replace('\\', '/')
         
-        if file_path.endswith('.ncx'):
-            content = fix_ncx_file(content, opf_content, fragment_index, rel_path)
+        lower_file_path = file_path.lower()
+        if lower_file_path.endswith('.ncx'):
+            content = fix_ncx_file(
+                content,
+                opf_content,
+                fragment_index,
+                rel_path,
+                fragment_rewrites,
+            )
             # Fix duplicate class attributes specifically for NCX
             lines = content.split('\n')
             for i, line in enumerate(lines):
@@ -800,20 +1267,28 @@ def process_file(file_path, opf_content=None, fragment_index=None, root_dir=None
                         remaining = re.sub(r'\s+class="[^"]*"', '', remaining)
                         lines[i] = new_line[:quote_pos + 1] + remaining
             content = '\n'.join(lines)
-        elif file_path.endswith('.opf'):
-            content = fix_opf_file(content)
-            # Fix fragment identifiers in OPF
-            content = re.sub(r'href="([^#]*)#[^"]*"', r'href="\1"', content)
-        elif file_path.endswith('.css'):
+        elif lower_file_path.endswith('.opf'):
+            content = fix_opf_file(content, target_version)
+        elif lower_file_path.endswith('.css'):
             # Fix CSS files with invalid font references
             content = fix_css_file(content)
         else:
-            if file_path.endswith('.xml') and '<html' not in content.lower():
+            if lower_file_path.endswith('.xml') and '<html' not in content.lower():
                 return False
-            content = fix_html_content(content)
-            content = fix_fragment_identifiers(content, file_path)
+            content = fix_html_content(content, target_version)
+            content = fix_fragment_identifiers(
+                content,
+                rel_path or file_path,
+                fragment_index,
+                root_dir,
+                fragment_rewrites,
+            )
             # Remove references to missing files
-            content = fix_missing_file_references(content)
+            content = fix_missing_file_references(
+                content,
+                rel_path or file_path,
+                available_paths,
+            )
         
         if content != original:
             with open(file_path, 'w', encoding='utf-8') as f:
@@ -824,41 +1299,79 @@ def process_file(file_path, opf_content=None, fragment_index=None, root_dir=None
         print(f"Error processing {file_path}: {e}")
         return False
 
-def fix_epub(epub_path):
-    """Main EPUB fixing function"""
+def fix_epub(epub_path, target_version="auto"):
+    """Repair an EPUB in place using automatic or explicit compatibility mode."""
     print(f"🔄 Processing: {epub_path}")
     
     with tempfile.TemporaryDirectory() as temp_dir:
         extract_dir = os.path.join(temp_dir, 'epub')
         extract_epub(epub_path, extract_dir)
         
-        # First, find and read OPF file to get correct identifier
+        # Read the package selected by container.xml, not an arbitrary OPF.
+        opf_file = find_opf_file(extract_dir)
         opf_content = None
-        opf_file = None
-        for root, dirs, files in os.walk(extract_dir):
-            for file in files:
-                if file.endswith('.opf'):
-                    opf_file = os.path.join(root, file)
-                    with open(opf_file, 'r', encoding='utf-8') as f:
-                        opf_content = f.read()
-                    break
-            if opf_content:
-                break
-        
+        if opf_file:
+            with open(opf_file, 'r', encoding='utf-8') as opf_handle:
+                opf_content = opf_handle.read()
+        resolved_target = resolve_target_version(target_version, opf_content)
+
         # Build fragment index for validating NCX fragment references
         fragment_index = build_fragment_index(extract_dir)
+
+        package_paths = set()
+        for root, _, files in os.walk(extract_dir):
+            package_paths.update(
+                os.path.relpath(os.path.join(root, file), extract_dir).replace('\\', '/')
+                for file in files
+            )
         
         # Find and process all relevant files
         process_files = []
         for root, dirs, files in os.walk(extract_dir):
             for file in files:
-                if file.endswith(('.xhtml', '.html', '.htm', '.ncx', '.opf', '.xml', '.css')):
+                if file.lower().endswith(('.xhtml', '.html', '.htm', '.ncx', '.opf', '.xml', '.css')):
                     process_files.append(os.path.join(root, file))
-        
+
+        # The package document should be normalized before consumers such as
+        # NCX are processed, so downstream files see repaired ids/metadata.
+        process_files.sort(
+            key=lambda path: (
+                0 if path == opf_file else 1 if path.lower().endswith('.ncx') else 2,
+                path,
+            )
+        )
+
+        # Precompute ID renames before fixing links. This lets a source file
+        # update a fragment that points to a later-processed target document.
+        fragment_rewrites = {}
+        for file_path in process_files:
+            lower_file_path = file_path.lower()
+            if not lower_file_path.endswith(('.xhtml', '.html', '.htm', '.xml', '.ncx')):
+                continue
+            try:
+                with open(file_path, 'r', encoding='utf-8') as file_handle:
+                    _, rewrites = _normalize_ids_with_mapping(file_handle.read())
+            except (OSError, UnicodeDecodeError):
+                continue
+            if rewrites:
+                rel_path = os.path.relpath(file_path, extract_dir).replace('\\', '/')
+                fragment_rewrites[rel_path] = rewrites
+
         fixed_count = 0
         for file_path in process_files:
-            if process_file(file_path, opf_content, fragment_index, extract_dir):
+            if process_file(
+                file_path,
+                opf_content,
+                fragment_index,
+                extract_dir,
+                resolved_target,
+                package_paths,
+                fragment_rewrites,
+            ):
                 fixed_count += 1
+            if file_path == opf_file:
+                with open(opf_file, 'r', encoding='utf-8') as opf_handle:
+                    opf_content = opf_handle.read()
         
         # Backup and repack
         backup = epub_path.replace('.epub', '_backup.epub')
@@ -868,17 +1381,17 @@ def fix_epub(epub_path):
         repack_epub(extract_dir, epub_path)
         print(f"✅ Fixed {fixed_count} files, backup saved as {backup}")
 
-def validate_and_fix(epub_path, max_iterations=5):
-    """Iterative validation and fixing"""
-    if not os.path.exists('epubcheck.jar'):
-        print("❌ epubcheck.jar not found")
+def validate_and_fix(epub_path, max_iterations=5, target_version="auto"):
+    """Iteratively validate and fix using the selected compatibility policy."""
+    if not os.path.exists(EPUBCHECK_JAR):
+        print(f"❌ epubcheck.jar not found at {EPUBCHECK_JAR}")
         return False
 
     for iteration in range(1, max_iterations + 1):
         print(f"\n🔄 Iteration {iteration}")
 
         output = run_epubcheck(epub_path)
-        error_count = output.count('ERROR(') + output.count('FATAL(')  # Also count FATAL errors
+        error_count, _ = count_errors(output)
 
         if error_count == 0:
             print("✅ EPUB is valid!")
@@ -890,23 +1403,29 @@ def validate_and_fix(epub_path, max_iterations=5):
         with open('output.txt', 'w', encoding='utf-8') as f:
             f.write(output)
 
-        fix_epub(epub_path)
+        fix_epub(epub_path, target_version=target_version)
 
     print("⚠️  Max iterations reached, check remaining errors")
     return False
 def main():
     """Command line interface"""
-    if len(sys.argv) != 2:
-        print("Usage: python epub_master_fixer.py <epub_file>")
-        return
-    
-    epub_path = sys.argv[1]
+    parser = argparse.ArgumentParser(description="Repair and validate an EPUB package.")
+    parser.add_argument("epub_path", help="Path to the EPUB file to process.")
+    parser.add_argument(
+        "--target",
+        choices=sorted(SUPPORTED_TARGET_VERSIONS),
+        default="auto",
+        help="Content compatibility policy (default: detect from the OPF package version).",
+    )
+    args = parser.parse_args()
+
+    epub_path = args.epub_path
     if not os.path.exists(epub_path):
         print(f"❌ File not found: {epub_path}")
         return
     
     print("🚀 EPUB Master Fixer Starting...")
-    validate_and_fix(epub_path)
+    validate_and_fix(epub_path, target_version=args.target)
 
 if __name__ == "__main__":
     main()

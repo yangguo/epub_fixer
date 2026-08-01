@@ -23,4 +23,5 @@ wrappers and the final reply comes from the Agent SDK loop. Use `--json` to prin
 - After the agent run, the CLI re-validates the EPUB. If errors remain, it keeps going by default.
 - Follow-up attempts reuse the OpenAI Agents SDK loop with the same tools, up to `--max-followups`
   additional passes (or disable with `--no-continue`).
-- The SDK package includes its own epubcheck runner and rule-based fixer (no imports from repo root).
+- The SDK package includes its own epubcheck runner and reuses the canonical rule-based fixer
+  from `epub_master_fixer.py`, keeping EPUB 2/3 behavior consistent with the root CLI.

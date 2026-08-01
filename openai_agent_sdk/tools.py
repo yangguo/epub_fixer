@@ -58,7 +58,11 @@ def validate_epub(epub_path: str) -> Dict[str, Any]:
     return result
 
 
-def apply_rule_based_fix(epub_path: str, output_path: Optional[str] = None) -> Dict[str, Any]:
+def apply_rule_based_fix(
+    epub_path: str,
+    output_path: Optional[str] = None,
+    target_version: str = "auto",
+) -> Dict[str, Any]:
     """Run the deterministic fixer and return the output path."""
     result: Dict[str, Any] = {
         "success": False,
@@ -95,7 +99,7 @@ def apply_rule_based_fix(epub_path: str, output_path: Optional[str] = None) -> D
         else:
             work_file = epub_path
 
-        fix_epub(work_file)
+        fix_epub(work_file, target_version=target_version)
         backup_path = work_file.replace(".epub", "_backup.epub")
 
         result.update(
@@ -152,6 +156,14 @@ TOOL_SCHEMAS = [
                     "output_path": {
                         "type": "string",
                         "description": "Optional output path for the fixed EPUB.",
+                    },
+                    "target_version": {
+                        "type": "string",
+                        "enum": ["auto", "epub2", "epub3"],
+                        "description": (
+                            "Compatibility policy. 'auto' detects the package version; "
+                            "an explicit target must match the package version."
+                        ),
                     },
                 },
                 "required": ["epub_path"],

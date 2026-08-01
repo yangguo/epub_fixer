@@ -21,6 +21,9 @@ A comprehensive EPUB validation and repair toolkit with optional AI-powered fixi
 # Fix common EPUB validation errors
 python epub_master_fixer.py book.epub
 
+# Explicitly select EPUB 2 repair rules (the OPF must declare EPUB 2)
+python epub_master_fixer.py book.epub --target epub2
+
 # Validate an EPUB
 python validate_epub.py book.epub
 
@@ -41,16 +44,20 @@ python epub_agent_cli.py book.epub --llm --workflow validation custom_fixing val
 
 ## 📊 What It Fixes
 
-### ✅ **EPUB 2.0.1 Compatibility**
-- Removes EPUB3-specific elements (epub:type, aria, role)
-- Converts HTML5→HTML4 (section→div, nav→div, figure→div)
+### ✅ **EPUB 2 / EPUB 3 Compatibility**
+- Automatically detects the package version and preserves EPUB 3 semantics by default
+- `auto` follows the OPF package version; an explicit target must match it
+- The fixer does not convert an EPUB 3 package into a complete EPUB 2 package
+- Repairs legacy `meta name="cover"` and EPUB 3 `cover-image` metadata together
+- Removes EPUB3-specific elements (epub:type, aria, role) only in EPUB 2 mode
+- Converts HTML5→HTML4 (section→div, nav→div, figure→div) only in EPUB 2 mode
 - Fixes charset and meta tags
 - Corrects NCX navigation structure
 
 ### 🔗 **Fragment Identifiers & Links**
 - Fixes broken internal links and TOC references
 - Validates anchor targets
-- Removes dead fragment links
+- Removes dead fragment links only when the target document is known
 - Repairs NCX playOrder conflicts
 
 ### 🏗️ **Structure & Syntax**
@@ -151,8 +158,9 @@ Uses the same rule-based fixer but routes decisions through the OpenAI Agents SD
 package with `function_tool` wrappers). Reads OpenAI settings from environment variables
 (`OPENAI_API_KEY`, optional `OPENAI_BASE_URL`, `OPENAI_MODEL`, etc.). The CLI auto-validates after
 the run and will reuse the OpenAI agent for follow-up passes until errors clear or `--max-followups`
-is reached (`--no-continue` to disable). The OpenAI SDK package carries its own epubcheck runner
-and rule-based fixer—no imports from the repo root.
+is reached (`--no-continue` to disable). The OpenAI SDK package keeps a local epubcheck runner
+and reuses the canonical rule-based fixer from `epub_master_fixer.py`, so both CLI paths apply
+the same EPUB 2/3 compatibility rules.
 
 ## 🔍 Understanding Output
 

@@ -2,13 +2,21 @@
 """Configuration management for EPUB tools"""
 
 import os
-from dotenv import load_dotenv
+
+
+try:
+    from dotenv import load_dotenv
+except ImportError:  # Optional for the deterministic, non-LLM fixer.
+    def load_dotenv(*_args, **_kwargs):
+        return False
 
 # Load environment variables
 load_dotenv()
 
 # EPUBCheck Configuration
-EPUBCHECK_JAR = 'epubcheck.jar'
+EPUBCHECK_JAR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), 'epubcheck.jar'
+)
 
 # Java Configuration
 JAVA_PATHS = [
